@@ -303,6 +303,143 @@ class FailureTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             rt.run()
 
+    def test_base_exception_reraises_same_object(self):
+        boom = KeyboardInterrupt("stop")
+
+        def handler(state, message, ctx):
+            raise boom
+
+        rt = ActorRuntime()
+        rt.register("a", None, handler)
+        rt.send("a", 1)
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            rt.run()
+        self.assertIs(caught.exception, boom)
+
+    def test_base_exception_keeps_message_pending(self):
+        class CustomBase(BaseException):
+            pass
+
+        def handler(state, message, ctx):
+            raise CustomBase()
+
+        rt = ActorRuntime()
+        rt.register("a", [], handler)
+        rt.send("a", "m", priority=7)
+        with self.assertRaises(CustomBase):
+            rt.run()
+        # Nothing committed; the message is still pending.
+        self.assertEqual(rt.get_state("a"), [])
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.trace(), [])
+
+    def test_base_exception_rolls_back_mutation_and_derived(self):
+        received = []
+
+        def handler(state, message, ctx):
+            state.append("dirty")
+            ctx.send("b", "derived")
+            raise SystemExit(1)
+
+        rt = ActorRuntime()
+        rt.register("a", [], handler)
+        rt.register("b", [], lambda s, m, c: (received.append(m), s)[1])
+        rt.send("a", "m")
+        with self.assertRaises(SystemExit):
+            rt.run()
+        self.assertEqual(rt.get_state("a"), [])
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(received, [])
+        self.assertEqual(rt.pending_count("b"), 0)
+        self.assertEqual(rt.trace(), [])
+
+    def test_base_exception_preserves_prior_commits(self):
+        def handler(state, message, ctx):
+            if message == "fail":
+                raise KeyboardInterrupt
+            return list(state) + [message]
+
+        rt = ActorRuntime()
+        rt.register("a", [], handler)
+        rt.send("a", "ok1")
+        rt.send("a", "fail")
+        rt.send("a", "ok2")
+        with self.assertRaises(KeyboardInterrupt):
+            rt.run()
+        self.assertEqual(rt.get_state("a"), ["ok1"])
+        self.assertEqual(rt.pending_count("a"), 2)
+        self.assertEqual(len(rt.trace()), 1)
+
+    def test_base_exception_retry_after_recovery(self):
+        attempts = []
+
+        def flaky(state, message, ctx):
+            attempts.append(message)
+            if len(attempts) == 1:
+                raise KeyboardInterrupt
+            return list(state) + [message]
+
+        rt = ActorRuntime()
+        rt.register("a", [], flaky)
+        mid = rt.send("a", "m", priority=3)
+        with self.assertRaises(KeyboardInterrupt):
+            rt.run()
+        self.assertEqual(rt.pending_count("a"), 1)
+        # Same message retried with original id and priority; succeeds once.
+        self.assertEqual(rt.run(), 1)
+        self.assertEqual(rt.get_state("a"), ["m"])
+        self.assertEqual(rt.pending_count("a"), 0)
+        entries = rt.trace()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].message_id, mid)
+        self.assertEqual(entries[0].priority, 3)
+
+    def test_base_exception_does_not_consume_derived_ids(self):
+        def bad(state, message, ctx):
+            ctx.send("a", "derived")
+            raise KeyboardInterrupt
+
+        rt = ActorRuntime()
+        rt.register("a", [], bad)
+        rt.send("a", "m")
+        with self.assertRaises(KeyboardInterrupt):
+            rt.run()
+        # The buffered derived send was dropped without consuming an id.
+        self.assertEqual(rt.send("a", "next"), 2)
+
+    def test_base_exception_determinism_across_reruns(self):
+        def build_and_run():
+            rt = ActorRuntime()
+            attempts = []
+
+            def flaky(state, message, ctx):
+                if message == "flaky" and not attempts:
+                    attempts.append(message)
+                    ctx.send("b", "dropped")
+                    raise KeyboardInterrupt
+                if message == "flaky":
+                    ctx.send("b", "derived")
+                return list(state) + [message]
+
+            rt.register("a", [], flaky)
+            rt.register("b", [], append_handler)
+            rt.send("a", "ok")
+            rt.send("a", "flaky")
+            with self.assertRaises(KeyboardInterrupt):
+                rt.run()
+            rt.run()
+            return (
+                rt.get_state("a"),
+                rt.get_state("b"),
+                rt.pending_count("a"),
+                rt.pending_count("b"),
+                [tuple(e) for e in rt.trace()],
+            )
+
+        first = build_and_run()
+        for _ in range(3):
+            self.assertEqual(build_and_run(), first)
+
 
 class TraceTests(unittest.TestCase):
     def test_trace_fields_and_completion_order(self):

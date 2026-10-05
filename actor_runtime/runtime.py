@@ -142,8 +142,10 @@ class ActorRuntime:
         """Process pending messages until mailboxes empty or ``limit`` hit.
 
         Derived messages become eligible only after the handling message
-        completes. The first handler failure aborts the run with
-        :class:`ActorExecutionError`; the failing message stays pending.
+        completes. The first handler failure aborts the run: an ordinary
+        :class:`Exception` is wrapped in :class:`ActorExecutionError`, while
+        a :class:`BaseException` (e.g. :class:`KeyboardInterrupt`) propagates
+        unwrapped. Either way the failing message stays pending.
         Returns the number of messages completed by this call.
         """
         if limit is not None and (
@@ -181,6 +183,12 @@ class ActorRuntime:
                 raise ActorExecutionError(
                     actor.name, message_id, exc
                 ) from exc
+            except BaseException:
+                # KeyboardInterrupt, SystemExit and other non-Exception
+                # failures propagate unwrapped, but the message must still
+                # stay unacknowledged exactly like an ordinary failure.
+                heapq.heappush(actor.mailbox, (neg_priority, message_id, message))
+                raise
 
             # Commit: derived sends enqueue only after successful completion.
             for derived_target, derived_message in context._pending:
