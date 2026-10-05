@@ -303,6 +303,122 @@ class FailureTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             rt.run()
 
+    def test_base_exception_keeps_message_pending(self):
+        class CustomBase(BaseException):
+            pass
+
+        boom = CustomBase("stop")
+
+        def handler(state, message, ctx):
+            raise boom
+
+        rt = ActorRuntime()
+        rt.register("a", [], handler)
+        mid = rt.send("a", "m", priority=7)
+        rt.send("a", "later", priority=1)
+        with self.assertRaises(CustomBase) as caught:
+            rt.run()
+        # The exact same exception object propagates, unwrapped.
+        self.assertIs(caught.exception, boom)
+        # The failing message stays pending and blocks what is behind it.
+        self.assertEqual(rt.pending_count("a"), 2)
+        self.assertEqual(rt.get_state("a"), [])
+        self.assertEqual(rt.trace(), [])
+        # Failing again keeps the same message at the head of the mailbox.
+        with self.assertRaises(CustomBase):
+            rt.run()
+        self.assertEqual(rt.pending_count("a"), 2)
+
+    def test_base_exception_commits_nothing_and_preserves_prior_results(self):
+        flag = {"fail": False}
+
+        def handler(state, message, ctx):
+            state = list(state)
+            state.append(message)
+            if message == "boom":
+                ctx.send("b", "derived")
+                raise SystemExit(3)
+            return state
+
+        rt = ActorRuntime()
+        rt.register("a", [], handler)
+        rt.register("b", [], append_handler)
+        rt.send("a", "ok")
+        rt.send("a", "boom")
+        with self.assertRaises(SystemExit):
+            rt.run()
+        # Prior completion stays committed; the failed message commits no
+        # state change, no derived delivery and no trace entry.
+        self.assertEqual(rt.get_state("a"), ["ok"])
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.pending_count("b"), 0)
+        self.assertEqual([t.message_id for t in rt.trace()], [1])
+
+        # Recover: the handler stops failing, the same message is retried
+        # and completes exactly once with continuous message ids.
+        def recovering(state, message, ctx):
+            state = list(state)
+            state.append(message)
+            if message == "boom" and flag["fail"]:
+                ctx.send("b", "derived")
+                raise KeyboardInterrupt
+            if message == "boom":
+                ctx.send("b", "derived")
+            return state
+
+        rt2 = ActorRuntime()
+        rt2.register("a", [], recovering)
+        rt2.register("b", [], append_handler)
+        rt2.send("a", "ok")
+        rt2.send("a", "boom")
+        flag["fail"] = True
+        with self.assertRaises(KeyboardInterrupt):
+            rt2.run()
+        flag["fail"] = False
+        done = rt2.run()
+        self.assertEqual(done, 2)  # retried "boom" plus its derived message
+        self.assertEqual(rt2.get_state("a"), ["ok", "boom"])
+        self.assertEqual(rt2.get_state("b"), ["derived"])
+        self.assertEqual(rt2.pending_count("a"), 0)
+        # The failed attempt consumed no message id and left no trace; the
+        # retried message keeps its original id and the derived one follows.
+        self.assertEqual([t.message_id for t in rt2.trace()], [1, 2, 3])
+        self.assertEqual([t.actor_name for t in rt2.trace()], ["a", "a", "b"])
+
+    def test_base_exception_failure_is_deterministic_across_runs(self):
+        def build_and_run():
+            flag = {"fail": True}
+
+            def handler(state, message, ctx):
+                state = dict(state)
+                state["n"] = state.get("n", 0) + 1
+                if message == "risky":
+                    ctx.send("b", "go")
+                    if flag["fail"]:
+                        raise KeyboardInterrupt
+                return state
+
+            rt = ActorRuntime()
+            rt.register("a", {}, handler)
+            rt.register("b", [], append_handler)
+            rt.send("a", "first", priority=2)
+            rt.send("a", "risky", priority=1)
+            with self.assertRaises(KeyboardInterrupt):
+                rt.run()
+            flag["fail"] = False
+            rt.run()
+            return (
+                copy.deepcopy(rt.get_state("a")),
+                copy.deepcopy(rt.get_state("b")),
+                rt.pending_count("a"),
+                rt.pending_count("b"),
+                [tuple(e) for e in rt.trace()],
+            )
+
+        first = build_and_run()
+        for _ in range(3):
+            self.assertEqual(build_and_run(), first)
+
 
 class TraceTests(unittest.TestCase):
     def test_trace_fields_and_completion_order(self):
