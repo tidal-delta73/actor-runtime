@@ -125,6 +125,47 @@ rt.send_once("other", "order-42", {"n": 1})  # accepted: other actor, same key
   independent runtimes produce identical `DedupResult` sequences, final
   states and completion traces.
 
+### Deterministic snapshots
+
+`rt.export_snapshot()` returns the complete runtime state as persistable
+`bytes`; `ActorRuntime.restore_snapshot(data, handlers)` resumes a new
+runtime from those bytes plus a mapping of actor name to handler. Handlers
+are code and are never serialised — restoring never imports modules or
+executes objects carried by the snapshot.
+
+```python
+data = rt.export_snapshot()          # bytes: write them anywhere
+restored = ActorRuntime.restore_snapshot(data, {"counter": counter, "logger": logger})
+restored.clock()                    # the snapshot moment
+restored.send_once("counter", "order-42", {"n": 1})
+# DedupResult(message_id=1, accepted=False) — dedup records survive
+```
+
+- The snapshot covers actor registration order and current states, every
+  unacknowledged mailbox message with its priority and id, the timed
+  deliveries neither released nor expired, the dedup records, the logical
+  clock, the next message id and the completion trace.
+- Snapshot-safe data: `None`, booleans, integers, finite floats, strings,
+  bytes and lists, tuples and string-keyed dicts composed recursively from
+  those. Dicts with the same content in different key order produce
+  identical bytes; two runtimes with identical observable state export
+  byte-identical snapshots, and two runtimes restored from the same
+  snapshot evolve identically under the same call sequence.
+- Export raises `SnapshotError` on sets, custom objects, non-string mapping
+  keys, NaN/infinite floats or circular references — and changes nothing:
+  states, queues, clock, dedup records, trace and numbering stay as they
+  were. In-memory behaviour for arbitrary deep-copyable objects is
+  unchanged; the restriction only applies while exporting.
+- Restore raises `SnapshotError` for truncated, tampered, unsupported
+  version, missing-field or internally inconsistent bytes, and
+  `LookupError` when `handlers` lacks an actor present in the snapshot
+  (extra entries are ignored). A failed restore returns no runtime at all.
+- After a successful restore every read-only query immediately reflects
+  the snapshot moment, old dedup keys still confirm their first id, new
+  deliveries continue numbering from the saved next id, timed deliveries
+  keep their original deadlines and `run` keeps its registration-order,
+  priority, rollback and derived-message commit rules.
+
 ### Semantics
 
 - An actor is a unique non-empty string name, an initial state and a handler
@@ -163,9 +204,11 @@ rt.send_once("other", "order-42", {"n": 1})  # accepted: other actor, same key
   `TraceEntry` has `message_id`, `actor_name`, `priority`, `state_before`
   and `state_after`.
 
-Only single-process in-memory semantics are provided: no persistence,
-supervision or parallel scheduling. Time is logical and only advances via
-explicit `advance` calls — there is no wall-clock access and no threads.
+Only single-process semantics are provided: no supervision, parallel
+scheduling or implicit persistence — snapshots are exported and restored
+only through the explicit `export_snapshot` / `restore_snapshot` entries.
+Time is logical and only advances via explicit `advance` calls — there is
+no wall-clock access and no threads.
 
 ## Tests
 
