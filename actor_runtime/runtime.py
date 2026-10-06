@@ -24,6 +24,7 @@ __all__ = [
     "ActorExecutionError",
     "ActorRuntime",
     "AdvanceResult",
+    "DedupResult",
     "TraceEntry",
 ]
 
@@ -54,6 +55,21 @@ class AdvanceResult(NamedTuple):
     time: int
     released: tuple[int, ...]
     expired: tuple[int, ...]
+
+
+class DedupResult(NamedTuple):
+    """Outcome of an idempotent :meth:`ActorRuntime.send_once` delivery.
+
+    ``message_id`` is the id of the first delivery made with the target and
+    ``delivery_key`` combination; it stays the same whether this call made
+    that delivery or merely confirmed an existing one. ``accepted`` is
+    ``True`` only for the first call, which behaves exactly like
+    :meth:`ActorRuntime.send`; later calls return the same id with
+    ``accepted`` ``False`` and change nothing.
+    """
+
+    message_id: int
+    accepted: bool
 
 
 class ActorDataCopyError(Exception):
@@ -174,6 +190,11 @@ class ActorRuntime:
         # Pending timed deliveries, kept in scheduling (message-id) order;
         # _release_due scans and rebuilds it.
         self._scheduled: list[_ScheduledDelivery] = []
+        # Idempotent deliveries reserved by send_once, keyed by
+        # (actor, delivery_key). A reservation is made when the first
+        # delivery enters its mailbox and is never withdrawn: it survives
+        # handler failure and retry, completion and the whole runtime life.
+        self._dedup: dict[tuple[_Actor, str], int] = {}
 
     # -- registration -----------------------------------------------------
 
@@ -215,6 +236,63 @@ class ActorRuntime:
         self._next_message_id += 1
         heapq.heappush(actor.mailbox, (-priority, message_id, stored))
         return message_id
+
+    def send_once(self, target: str, delivery_key: str, message: Any,
+                  priority: int = 0) -> DedupResult:
+        """Deliver a message idempotently under ``delivery_key``.
+
+        Behaves exactly like :meth:`send` on the first call for a given
+        ``(target, delivery_key)`` combination: the message is deep-copied,
+        gets the next id from the runtime-wide monotonic sequence and enters
+        the mailbox under the usual priority rules. The returned
+        :class:`DedupResult` carries that id with ``accepted`` ``True``.
+
+        Every later call with the same target and key returns a result with
+        the first id and ``accepted`` ``False``, whether the original is
+        still pending, has already completed or is waiting to be retried
+        after a handler failure. Such a call enqueues nothing, consumes no
+        id and changes neither the state, the trace nor the original
+        delivery's priority; the supplied ``message`` is only a positional
+        placeholder and is neither copied nor compared. The scope is the
+        (actor, key) pair, so different actors may freely reuse a key.
+
+        The reservation outlives a failed first handling: the message stays
+        in its mailbox under the existing failure/rollback rules and a
+        resubmission of the same key is only ever a duplicate confirmation.
+        Records persist for the runtime's whole lifetime.
+
+        Raises :class:`TypeError` if ``priority`` is not a non-boolean
+        integer or ``delivery_key`` is not a string, :class:`ValueError` if
+        ``delivery_key`` is empty and :class:`LookupError` if ``target`` is
+        unknown -- all before any deduplication record is consulted. If the
+        first message cannot be deep-copied, :class:`ActorDataCopyError` is
+        raised and neither the key nor an id is retained, so the corrected
+        message can be submitted again under the same key.
+        """
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            raise TypeError("priority must be an integer")
+        if not isinstance(delivery_key, str):
+            raise TypeError("delivery_key must be a string")
+        if delivery_key == "":
+            raise ValueError("delivery_key must be a non-empty string")
+        actor = self._actors.get(target)
+        if actor is None:
+            raise LookupError(f"unknown actor: {target!r}")
+        dedup_key = (actor, delivery_key)
+        existing = self._dedup.get(dedup_key)
+        if existing is not None:
+            # A duplicate confirmation: the placeholder message is never
+            # copied or inspected, and nothing else changes.
+            return DedupResult(existing, False)
+        # Copy before reserving the key or assigning an id, exactly like
+        # send: a failed copy leaves the key free for a corrected retry and
+        # consumes no id.
+        stored = _copy_data("message", message)
+        message_id = self._next_message_id
+        self._next_message_id += 1
+        heapq.heappush(actor.mailbox, (-priority, message_id, stored))
+        self._dedup[dedup_key] = message_id
+        return DedupResult(message_id, True)
 
     def schedule(self, target: str, message: Any, delay: int,
                  ttl: int | None = None, priority: int = 0) -> int:

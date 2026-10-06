@@ -113,6 +113,49 @@ rt.run()                            # advance never invokes a handler
   `TraceEntry` has `message_id`, `actor_name`, `priority`, `state_before`
   and `state_after`.
 
+### Idempotent delivery
+
+`send_once(target, delivery_key, message, priority=0)` delivers at-most-once
+into a mailbox under a caller-chosen key, so at-least-once redelivery can be
+recognised without changing ordinary `send`:
+
+```python
+first = rt.send_once("counter", "order-42", {"n": 1})
+# DedupResult(message_id=1, accepted=True): behaves exactly like send.
+again = rt.send_once("counter", "order-42", {"n": 1})
+# DedupResult(message_id=1, accepted=False): same id, nothing re-enqueued.
+rt.send_once("counter", "order-42", object())  # placeholder is never copied
+rt.send_once("logger", "order-42", "x")        # accepted=True: key is per actor
+```
+
+- The dedup scope is the `(target actor, delivery_key)` pair; the same key
+  reused for a different actor is an independent delivery. Records live for
+  the whole lifetime of the runtime instance.
+- The first valid call deep-copies the message, takes the next id from the
+  shared monotonic sequence and enqueues it under the normal
+  registration-order / priority / id rules, returning
+  `DedupResult(message_id, accepted=True)` (an immutable named tuple).
+- Every later call with the same pair returns the first id with
+  `accepted=False`, whether the original is still pending, has completed or
+  is waiting for a failure retry. It enqueues nothing, consumes no id and
+  does not change the state, the trace or the original's priority; its
+  `message` is a pure placeholder and is neither copied nor compared.
+- If the first handler fails, the existing `ActorExecutionError`,
+  mailbox-retry and rollback conventions apply unchanged and the key
+  reservation is kept: resubmitting the same key only yields a duplicate
+  confirmation, and retrying `run` processes the original, so one successful
+  handling produces at most one `TraceEntry`.
+- Validation happens before any dedup lookup: non-boolean-integer
+  `priority` raises `TypeError`, a non-string `delivery_key` raises
+  `TypeError`, an empty one raises `ValueError` and an unknown target raises
+  `LookupError`. A first message that cannot be deep-copied raises
+  `ActorDataCopyError` without reserving the key or consuming an id, so the
+  corrected message can be retried under the same key.
+- Ordinary `send`, `schedule`, `ctx.send`, mailbox selection, timed release
+  and expiry, read-only queries and failure atomicity are unchanged; plain
+  deliveries never participate in deduplication.
+
+
 Only single-process in-memory semantics are provided: no persistence,
 supervision or parallel scheduling. Time is logical and only advances via
 explicit `advance` calls — there is no wall-clock access and no threads.
