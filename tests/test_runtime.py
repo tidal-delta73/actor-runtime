@@ -4,6 +4,7 @@ import unittest
 
 from actor_runtime import (
     ActorContext,
+    ActorDataCopyError,
     ActorExecutionError,
     ActorRuntime,
     TraceEntry,
@@ -469,6 +470,219 @@ class TraceTests(unittest.TestCase):
         payload.append(3)
         rt.run()
         self.assertEqual(rt.get_state("a"), [1, 2])
+
+
+class FlakyCopy:
+    """An object whose ``__deepcopy__`` raises while the class flag is set."""
+
+    fail = False
+
+    def __init__(self, value=None):
+        self.value = value
+
+    def __deepcopy__(self, memo):
+        if FlakyCopy.fail:
+            raise RuntimeError("copy boom")
+        return FlakyCopy(self.value)
+
+    def __eq__(self, other):
+        return isinstance(other, FlakyCopy) and other.value == self.value
+
+
+class FlakyCopyContextManager:
+    """Reset ``FlakyCopy.fail`` even when an assertion raises."""
+
+    def __init__(self, fail):
+        self.fail = fail
+
+    def __enter__(self):
+        FlakyCopy.fail = self.fail
+
+    def __exit__(self, *exc):
+        FlakyCopy.fail = False
+        return False
+
+
+def flaky(fail=True):
+    return FlakyCopyContextManager(fail)
+
+
+class CopyBoundaryTests(unittest.TestCase):
+    def test_send_copy_failure_raises_and_preserves_original(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        self.assertEqual(rt.send("a", "ok"), 1)
+        with flaky():
+            with self.assertRaises(ActorDataCopyError) as caught:
+                rt.send("a", FlakyCopy("x"))
+        err = caught.exception
+        self.assertIsInstance(err.original, RuntimeError)
+        self.assertEqual(str(err.original), "copy boom")
+        # Nothing changed: mailbox, trace, state and the next id.
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.trace(), [])
+        self.assertEqual(rt.get_state("a"), [])
+        # The failed delivery consumed no id: the next successful send gets
+        # the id the failed one would have been assigned.
+        self.assertEqual(rt.send("a", "next"), 2)
+        self.assertEqual(rt.send("a", "after"), 3)
+
+    def test_send_validation_precedes_copy(self):
+        rt = ActorRuntime()
+        rt.register("a", None, noop_handler)
+        with flaky():
+            with self.assertRaises(TypeError):
+                rt.send("a", FlakyCopy(), priority=1.5)
+            with self.assertRaises(LookupError):
+                rt.send("ghost", FlakyCopy())
+        self.assertEqual(rt.send("a", "m"), 1)
+
+    def test_state_copy_failure_before_processing_is_retryable(self):
+        rt = ActorRuntime()
+        rt.register("a", {"box": FlakyCopy("s")}, append_handler)
+        mid = rt.send("a", "m", priority=7)
+        rt.send("a", "later", priority=1)
+        with flaky():
+            with self.assertRaises(ActorExecutionError) as caught:
+                rt.run()
+        err = caught.exception
+        self.assertEqual(err.actor_name, "a")
+        self.assertEqual(err.message_id, mid)
+        self.assertIsInstance(err.original, ActorDataCopyError)
+        self.assertIsInstance(err.original.original, RuntimeError)
+        # The message stays pending at its original priority; nothing
+        # committed, no id consumed.
+        self.assertEqual(rt.pending_count("a"), 2)
+        self.assertEqual(rt.trace(), [])
+        self.assertEqual(rt.get_state("a"), {"box": FlakyCopy("s")})
+        self.assertEqual(rt.send("a", "extra"), 3)
+        # After the copy source is fixed the same messages process in
+        # priority order and commit exactly once.
+        done = rt.run()
+        self.assertEqual(done, 3)
+        self.assertEqual(
+            [t.message_id for t in rt.trace()], [mid, 2, 3]
+        )
+        self.assertEqual([t.priority for t in rt.trace()], [7, 1, 0])
+
+    def test_handler_message_copy_failure_keeps_message_pending(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        mid = rt.send("a", FlakyCopy("m"))  # copied into the mailbox fine
+        with flaky():
+            with self.assertRaises(ActorExecutionError) as caught:
+                rt.run()
+        self.assertEqual(caught.exception.message_id, mid)
+        self.assertIsInstance(caught.exception.original, ActorDataCopyError)
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.trace(), [])
+        rt.run()
+        self.assertEqual(rt.get_state("a"), [FlakyCopy("m")])
+        self.assertEqual(len(rt.trace()), 1)
+
+    def test_returned_state_copy_failure_commits_nothing(self):
+        def handler(state, message, ctx):
+            return {"box": FlakyCopy(message)}
+
+        rt = ActorRuntime()
+        rt.register("a", "initial", handler)
+        mid = rt.send("a", "m")
+        with flaky():
+            with self.assertRaises(ActorExecutionError) as caught:
+                rt.run()
+        err = caught.exception
+        self.assertEqual(err.message_id, mid)
+        self.assertIsInstance(err.original, ActorDataCopyError)
+        self.assertEqual(rt.get_state("a"), "initial")
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.trace(), [])
+        # Retry after the fix commits exactly once with one trace entry.
+        done = rt.run()
+        self.assertEqual(done, 1)
+        self.assertEqual(rt.get_state("a"), {"box": FlakyCopy("m")})
+        entries = rt.trace()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].state_before, "initial")
+        self.assertEqual(entries[0].state_after, {"box": FlakyCopy("m")})
+
+    def test_derived_copy_failure_is_all_or_nothing(self):
+        def handler(state, message, ctx):
+            ctx.send("b", "first")
+            ctx.send("b", "second")
+            ctx.send("b", FlakyCopy("third"))
+            return state
+
+        rt = ActorRuntime()
+        rt.register("a", None, handler)
+        rt.register("b", [], append_handler)
+        rt.register("c", [], append_handler)
+        mid = rt.send("a", "go")
+        with flaky():
+            with self.assertRaises(ActorExecutionError) as caught:
+                rt.run()
+        self.assertEqual(caught.exception.message_id, mid)
+        self.assertIsInstance(caught.exception.original, ActorDataCopyError)
+        # Even though only the last derived message cannot be copied, none
+        # of them became visible and no derived id was consumed.
+        self.assertEqual(rt.pending_count("b"), 0)
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.trace(), [])
+        self.assertEqual(rt.send("c", "probe"), mid + 1)
+        # Retry after the fix delivers every derived message exactly once.
+        done = rt.run()
+        self.assertEqual(done, 5)  # retried "go" + 3 derived + "probe"
+        self.assertEqual(
+            rt.get_state("b"),
+            ["first", "second", FlakyCopy("third")],
+        )
+        self.assertEqual(rt.get_state("c"), ["probe"])
+        self.assertEqual(rt.pending_count("a"), 0)
+
+    def test_copy_failure_keeps_prior_completions(self):
+        def handler(state, message, ctx):
+            if message == "bad":
+                return FlakyCopy("state")
+            return list(state) + [message]
+
+        rt = ActorRuntime()
+        rt.register("a", [], handler)
+        rt.send("a", "ok")
+        rt.send("a", "bad")
+        with flaky():
+            with self.assertRaises(ActorExecutionError):
+                rt.run()
+        self.assertEqual(rt.get_state("a"), ["ok"])
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual([t.message_id for t in rt.trace()], [1])
+        rt.run()
+        self.assertEqual(rt.get_state("a"), FlakyCopy("state"))
+        self.assertEqual(len(rt.trace()), 2)
+
+    def test_committed_objects_are_isolated_from_later_mutation(self):
+        captured = {}
+
+        def handler(state, message, ctx):
+            new_state = {"items": [1]}
+            payload = {"v": [1]}
+            captured["state"] = new_state
+            captured["payload"] = payload
+            ctx.send("b", payload)
+            return new_state
+
+        rt = ActorRuntime()
+        rt.register("a", None, handler)
+        rt.register("b", [], append_handler)
+        rt.send("a", "go")
+        rt.run()
+        # Mutating the objects the handler returned or sent must not leak
+        # into runtime state, the delivered message or the trace.
+        captured["state"]["items"].append(999)
+        captured["payload"]["v"].append(999)
+        self.assertEqual(rt.get_state("a"), {"items": [1]})
+        self.assertEqual(rt.get_state("b"), [{"v": [1]}])
+        entries = rt.trace()
+        self.assertEqual(entries[0].state_after, {"items": [1]})
+        self.assertEqual(entries[1].state_after, [{"v": [1]}])
 
 
 class DeterminismTests(unittest.TestCase):
