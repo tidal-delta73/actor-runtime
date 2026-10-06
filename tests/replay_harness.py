@@ -317,9 +317,16 @@ def encode_records(records: list[dict], *,
                    schema: int = SCHEMA_VERSION,
                    codec: str = CODEC) -> bytes:
     out = bytearray()
-    out += _frame({"t": "header", "schema": schema, "codec": codec})
-    for rec in records:
-        out += _frame(rec)
+    # The header declares the frame count so a log whose tail was truncated
+    # cannot look like a complete shorter history; every frame additionally
+    # carries its 1-based position so a dropped, duplicated or reordered frame
+    # is rejected while parsing (see parse_records).
+    out += _frame({"t": "header", "schema": schema, "codec": codec,
+                   "records": len(records)})
+    for index, rec in enumerate(records, start=1):
+        framed = dict(rec)
+        framed["log"] = index
+        out += _frame(framed)
     return bytes(out)
 
 
@@ -355,20 +362,55 @@ def _read_frame(stream: io.BytesIO, *, require_header: bool) -> Optional[dict]:
 
 
 def parse_records(blob: bytes, *, start_offset: int = 0,
-                  require_header: bool = True) -> list[dict]:
+                  require_header: bool = True,
+                  strict_log: bool | None = None) -> list[dict]:
+    """Decode a journal into its durable records.
+
+    A full-log parse (``start_offset == 0``) is *authenticated*: the header's
+    declared frame count must match the frames present, and every frame's
+    ``log`` position must be exactly its 1-based place in the stream. Any
+    truncation, dropped frame, duplicate or swap therefore fails with
+    :class:`CorruptRecordError` rather than being silently replayed as a
+    different history. A mid-log suffix read (snapshot recovery) carries
+    absolute positions that do not restart at 1, so it opts out of the
+    position check with ``strict_log=False`` while frames are still decoded.
+    """
+    if strict_log is None:
+        strict_log = start_offset == 0
     stream = io.BytesIO(blob)
     stream.seek(start_offset)
     records = []
+    declared_count: Optional[int] = None
+    if start_offset == 0:
+        header = _read_frame(stream, require_header=True)
+        if header is not None:
+            count = header.get("records")
+            if count is not None:
+                declared_count = count
+    expected_log = 1
     while True:
-        rec = _read_frame(stream, require_header=require_header)
-        require_header = False
+        rec = _read_frame(stream, require_header=False)
         if rec is None:
             break
         if rec.get("t") == "header":
-            continue
+            raise CorruptRecordError("unexpected header frame mid-log")
+        if strict_log:
+            position = rec.get("log")
+            if position != expected_log:
+                raise CorruptRecordError(
+                    f"frame out of order: expected log position "
+                    f"{expected_log}, got {position!r}"
+                )
+            expected_log += 1
         records.append(rec)
-    if start_offset == 0 and not records:
-        raise CorruptRecordError("journal contains only a header")
+    if start_offset == 0:
+        if not records and declared_count != 0:
+            raise CorruptRecordError("journal contains only a header")
+        if declared_count is not None and declared_count != len(records):
+            raise CorruptRecordError(
+                f"truncated journal: header declares {declared_count} "
+                f"records, stream contains {len(records)}"
+            )
     return records
 
 
