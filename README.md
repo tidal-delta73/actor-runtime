@@ -49,17 +49,21 @@ rt.trace()                # list of TraceEntry, in completion order
   duplicate name raises `ValueError`.
 - `send(target, message, priority=0)` returns a runtime-wide monotonic
   message id and enqueues a private copy in the actor's mailbox. Unknown
-  targets raise `LookupError`; non-integer priority raises `TypeError`.
+  targets raise `LookupError`; non-integer priority raises `TypeError`; a
+  message that cannot be deep-copied raises `ActorDataCopyError`.
   Failed deliveries consume no id.
 - Scheduling: the actor with the earliest registration order and a non-empty
   mailbox is selected; within a mailbox, higher priority wins, then lower
   message id. Messages a handler sends through `ctx.send` are enqueued only
   after the handler returns successfully.
 - Atomic commit: state and derived deliveries are committed together only
-  after the handler returns normally. If the handler raises, the message
-  stays unacknowledged, nothing is committed and `run` raises
-  `ActorExecutionError` (exposing `actor_name`, `message_id` and
-  `original`); earlier completed messages remain committed.
+  after the handler returns normally and every result has been copied. If
+  the handler raises, or copying the state, the message, the handler result
+  or a buffered derived message fails, the message stays unacknowledged,
+  nothing is committed (no state, no derived delivery, no id, no trace
+  entry) and `run` raises `ActorExecutionError` (exposing `actor_name`,
+  `message_id` and `original` — an `ActorDataCopyError` for copy
+  failures); earlier completed messages remain committed.
 - `run(limit=None)` processes until idle; a non-positive or non-integer
   `limit` raises `ValueError` without consuming any message. `BaseException`
   subclasses (e.g. `KeyboardInterrupt`) propagate unwrapped.
