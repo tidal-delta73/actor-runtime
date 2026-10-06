@@ -16,7 +16,9 @@ python3 -m actor_runtime help
 Register named actors, deliver messages to their mailboxes and explicitly
 advance the runtime. Processing order is fully deterministic and depends only
 on registration order, message priority and delivery id — never on wall-clock
-time, randomness or threads.
+time, randomness or threads. Timed delivery uses a caller-driven logical
+clock: `schedule` parks a message and `advance` moves the clock, so time is
+just another replayable input.
 
 ```python
 from actor_runtime import ActorRuntime, ActorContext
@@ -66,14 +68,38 @@ rt.trace()                # list of TraceEntry, in completion order
   failures); earlier completed messages remain committed.
 - `run(limit=None)` processes until idle; a non-positive or non-integer
   `limit` raises `ValueError` without consuming any message. `BaseException`
-  subclasses (e.g. `KeyboardInterrupt`) propagate unwrapped.
-- `get_state`, `pending_count` and `trace` are read-only and return
-  independent copies; unknown actors raise `LookupError`. Each
+  subclasses (e.g. `KeyboardInterrupt`) propagate unwrapped. `run` never
+  advances the logical clock.
+- `now()` returns the current logical clock tick (0 initially). The clock
+  only moves through `advance`; the runtime never reads wall-clock time.
+- `schedule(target, message, delay, ttl=None, priority=0)` parks a timed
+  delivery and returns a message id from the same monotonic sequence as
+  `send`. `delay` (non-negative integer) is the number of ticks from now
+  until the message is due; `ttl` (`None` or positive integer) is how many
+  ticks from now it stays alive. `delay == 0` enters the mailbox
+  immediately. Validation mirrors `send`: non-integer (or boolean)
+  `priority`/`delay`/`ttl` raises `TypeError`, negative `delay` or
+  non-positive `ttl` raises `ValueError`, unknown targets raise
+  `LookupError`, uncopyable messages raise `ActorDataCopyError` — all
+  without consuming an id or changing any queue.
+- `advance(ticks)` moves the clock forward by a positive integer number of
+  ticks and returns an immutable `AdvanceResult(now, released, expired)`.
+  A parked message due at or before the new tick is released into its
+  actor's mailbox with its scheduled id and priority; one whose ttl ran
+  out expires instead — expiry is judged first, so it never reaches a
+  handler, produces no `TraceEntry` and changes no state. `released` and
+  `expired` are tuples ordered by event tick, then message id. Invalid
+  `ticks` (`TypeError`/`ValueError`) changes nothing.
+- `scheduled_count(actor)` counts parked timed deliveries not yet released
+  or expired; `pending_count(actor)` counts only messages already in the
+  mailbox. Unknown actors raise `LookupError`.
+- `get_state`, `pending_count`, `scheduled_count` and `trace` are read-only
+  and return independent copies; unknown actors raise `LookupError`. Each
   `TraceEntry` has `message_id`, `actor_name`, `priority`, `state_before`
   and `state_after`.
 
 Only single-process in-memory semantics are provided: no persistence,
-supervision, timed messages or parallel scheduling.
+supervision or parallel scheduling.
 
 ## Tests
 

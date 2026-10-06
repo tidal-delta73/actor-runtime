@@ -4,6 +4,7 @@ from .runtime import (
     ActorDataCopyError,
     ActorExecutionError,
     ActorRuntime,
+    AdvanceResult,
     TraceEntry,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "ActorDataCopyError",
     "ActorExecutionError",
     "ActorRuntime",
+    "AdvanceResult",
     "TraceEntry",
     "__version__",
 ]

@@ -5,6 +5,13 @@ named actors, deliver messages to their mailboxes and explicitly advance
 processing with :meth:`ActorRuntime.run`. Scheduling is fully determined by
 registration order, message priority and delivery id -- never by wall-clock
 time, randomness or thread interleaving.
+
+Timed delivery is equally explicit: :meth:`ActorRuntime.schedule` parks a
+message against a caller-driven logical clock and :meth:`ActorRuntime.advance`
+moves that clock forward, releasing due messages into mailboxes and expiring
+the ones whose time-to-live ran out. The runtime never reads wall-clock time;
+the clock only moves when the caller advances it, so time is just another
+replayable input.
 """
 from __future__ import annotations
 
@@ -17,6 +24,7 @@ __all__ = [
     "ActorDataCopyError",
     "ActorExecutionError",
     "ActorRuntime",
+    "AdvanceResult",
     "TraceEntry",
 ]
 
@@ -33,6 +41,21 @@ class TraceEntry(NamedTuple):
     priority: int
     state_before: Any
     state_after: Any
+
+
+class AdvanceResult(NamedTuple):
+    """Outcome of one :meth:`ActorRuntime.advance` call.
+
+    ``now`` is the clock value after the advance. ``released`` holds the ids
+    of scheduled messages that became due and entered their actor's mailbox;
+    ``expired`` holds the ids of scheduled messages whose time-to-live ran
+    out before release. Both are ordered by event tick, then by message id,
+    and both are immutable tuples.
+    """
+
+    now: int
+    released: tuple[int, ...]
+    expired: tuple[int, ...]
 
 
 class ActorDataCopyError(Exception):
@@ -108,8 +131,23 @@ def _copy_data(what: str, value: Any) -> Any:
         raise ActorDataCopyError(what, exc) from exc
 
 
+class _Scheduled(NamedTuple):
+    """One parked timed delivery.
+
+    ``fire_at`` is the tick at which the message becomes due (schedule tick
+    plus delay); ``expire_at`` is the tick at which it dies (schedule tick
+    plus ttl) or ``None`` when it never expires.
+    """
+
+    message_id: int
+    fire_at: int
+    expire_at: int | None
+    priority: int
+    message: Any
+
+
 class _Actor:
-    __slots__ = ("name", "state", "handler", "mailbox", "order")
+    __slots__ = ("name", "state", "handler", "mailbox", "order", "scheduled")
 
     def __init__(self, name: str, state: Any, handler: Handler, order: int):
         self.name = name
@@ -119,6 +157,8 @@ class _Actor:
         # Heap of (-priority, message_id, message); message_id is unique, so
         # the message object never participates in comparison.
         self.mailbox: list[tuple[int, int, Any]] = []
+        # Parked timed deliveries, in schedule call order.
+        self.scheduled: list[_Scheduled] = []
 
 
 class ActorRuntime:
@@ -128,6 +168,7 @@ class ActorRuntime:
         self._actors: dict[str, _Actor] = {}
         self._trace: list[TraceEntry] = []
         self._next_message_id = 1
+        self._clock = 0
 
     # -- registration -----------------------------------------------------
 
@@ -170,6 +211,123 @@ class ActorRuntime:
         heapq.heappush(actor.mailbox, (-priority, message_id, stored))
         return message_id
 
+    # -- logical clock ------------------------------------------------------
+
+    def now(self) -> int:
+        """Return the current logical clock tick (0 before any advance)."""
+        return self._clock
+
+    def schedule(
+        self,
+        target: str,
+        message: Any,
+        delay: int,
+        ttl: int | None = None,
+        priority: int = 0,
+    ) -> int:
+        """Park a timed delivery for ``target`` and return its message id.
+
+        Ids come from the same runtime-wide monotonic sequence as
+        :meth:`send`. ``delay`` is the number of ticks from the current tick
+        after which the message becomes due; ``ttl`` is the number of ticks
+        from now the message stays alive, or ``None`` for no expiry. A
+        message with ``delay == 0`` has not yet expired (``ttl`` is at least
+        1) and therefore enters the mailbox immediately; any other message
+        is parked until :meth:`advance` releases or expires it.
+
+        Raises :class:`TypeError` if ``priority``, ``delay`` or ``ttl`` has
+        a non-integer (or boolean) type, :class:`ValueError` if ``delay``
+        is negative or ``ttl`` is not positive, :class:`LookupError` if
+        ``target`` is unknown and :class:`ActorDataCopyError` if ``message``
+        cannot be deep-copied. A failed schedule consumes no id and changes
+        no clock, mailbox or scheduled queue.
+        """
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            raise TypeError("priority must be an integer")
+        if not isinstance(delay, int) or isinstance(delay, bool):
+            raise TypeError("delay must be an integer")
+        if delay < 0:
+            raise ValueError("delay must be a non-negative integer")
+        if ttl is not None:
+            if not isinstance(ttl, int) or isinstance(ttl, bool):
+                raise TypeError("ttl must be None or an integer")
+            if ttl <= 0:
+                raise ValueError("ttl must be a positive integer")
+        actor = self._actors.get(target)
+        if actor is None:
+            raise LookupError(f"unknown actor: {target!r}")
+        # Copy before assigning an id, exactly like send: a failed copy
+        # leaves the clock, the queues and the next message id untouched.
+        stored = _copy_data("message", message)
+        message_id = self._next_message_id
+        self._next_message_id += 1
+        if delay == 0:
+            heapq.heappush(actor.mailbox, (-priority, message_id, stored))
+        else:
+            actor.scheduled.append(
+                _Scheduled(
+                    message_id=message_id,
+                    fire_at=self._clock + delay,
+                    expire_at=None if ttl is None else self._clock + ttl,
+                    priority=priority,
+                    message=stored,
+                )
+            )
+        return message_id
+
+    def advance(self, ticks: int) -> AdvanceResult:
+        """Advance the logical clock by ``ticks`` and settle timed deliveries.
+
+        Every parked message whose expiry tick has been reached expires --
+        it is dropped without touching a handler, the state or the trace --
+        and every remaining parked message whose due tick has been reached
+        is released into its actor's mailbox, keeping the id and priority it
+        was scheduled with. Expiry is judged before release, so a message
+        whose ttl ran out at or before its due tick never arrives. Released
+        messages are processed by later :meth:`run` calls under the usual
+        mailbox ordering; :meth:`run` itself never moves the clock.
+
+        Returns an immutable :class:`AdvanceResult` with the new clock value
+        and the released/expired message ids, each ordered by event tick
+        then message id. Raises :class:`TypeError` if ``ticks`` is not an
+        integer (booleans included) and :class:`ValueError` if it is not
+        positive; a failed call changes no clock, id or queue.
+        """
+        if not isinstance(ticks, int) or isinstance(ticks, bool):
+            raise TypeError("ticks must be an integer")
+        if ticks <= 0:
+            raise ValueError("ticks must be a positive integer")
+        self._clock += ticks
+        now = self._clock
+
+        released: list[tuple[int, int, _Actor, _Scheduled]] = []
+        expired: list[tuple[int, int]] = []
+        for actor in self._actors.values():  # registration order
+            kept = []
+            for entry in actor.scheduled:
+                if entry.expire_at is not None and now >= entry.expire_at:
+                    expired.append((entry.expire_at, entry.message_id))
+                elif now >= entry.fire_at:
+                    released.append(
+                        (entry.fire_at, entry.message_id, actor, entry)
+                    )
+                else:
+                    kept.append(entry)
+            actor.scheduled = kept
+
+        # Stable event order: by the tick the event fell due, then by id.
+        released.sort(key=lambda item: (item[0], item[1]))
+        expired.sort(key=lambda item: (item[0], item[1]))
+        for _, _, actor, entry in released:
+            heapq.heappush(
+                actor.mailbox, (-entry.priority, entry.message_id, entry.message)
+            )
+        return AdvanceResult(
+            now=now,
+            released=tuple(item[1] for item in released),
+            expired=tuple(item[1] for item in expired),
+        )
+
     # -- execution --------------------------------------------------------
 
     def run(self, limit: int | None = None) -> int:
@@ -184,7 +342,9 @@ class ActorRuntime:
         derived message is raised as :class:`ActorExecutionError` whose
         ``original`` is an :class:`ActorDataCopyError`. Either way the
         failing message stays pending and nothing is committed for it.
-        Returns the number of messages completed by this call.
+        Returns the number of messages completed by this call. ``run``
+        never advances the logical clock and never touches parked timed
+        deliveries; only :meth:`advance` releases or expires them.
         """
         if limit is not None and (
             not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
@@ -285,9 +445,22 @@ class ActorRuntime:
         return copy.deepcopy(actor.state)
 
     def pending_count(self, actor_name: str) -> int:
-        """Return the number of unprocessed messages for the actor."""
+        """Return the number of unprocessed messages for the actor.
+
+        Only messages already in the mailbox count; parked timed deliveries
+        are reported by :meth:`scheduled_count` until they are released.
+        """
         actor = self._require_actor(actor_name)
         return len(actor.mailbox)
+
+    def scheduled_count(self, actor_name: str) -> int:
+        """Return the number of parked timed deliveries for the actor.
+
+        A scheduled message counts until :meth:`advance` releases it into
+        the mailbox or expires it. Unknown actors raise :class:`LookupError`.
+        """
+        actor = self._require_actor(actor_name)
+        return len(actor.scheduled)
 
     def trace(self) -> list[TraceEntry]:
         """Return completed processings in completion order.

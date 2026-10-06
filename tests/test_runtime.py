@@ -7,6 +7,7 @@ from actor_runtime import (
     ActorDataCopyError,
     ActorExecutionError,
     ActorRuntime,
+    AdvanceResult,
     TraceEntry,
 )
 
@@ -701,6 +702,221 @@ class DeterminismTests(unittest.TestCase):
                 copy.deepcopy(rt.get_state("b")),
                 rt.pending_count("a"),
                 rt.pending_count("b"),
+                [tuple(e) for e in rt.trace()],
+            )
+
+        first = build_and_run()
+        for _ in range(3):
+            self.assertEqual(build_and_run(), first)
+
+
+class TimedDeliveryTests(unittest.TestCase):
+    def test_clock_starts_at_zero_and_only_advance_moves_it(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        self.assertEqual(rt.now(), 0)
+        rt.send("a", "x")
+        rt.run()
+        self.assertEqual(rt.now(), 0)
+        result = rt.advance(5)
+        self.assertEqual(rt.now(), 5)
+        self.assertEqual(result, AdvanceResult(now=5, released=(), expired=()))
+
+    def test_schedule_shares_global_id_sequence_with_send(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        self.assertEqual(rt.send("a", "plain"), 1)
+        self.assertEqual(rt.schedule("a", "timed", delay=3), 2)
+        self.assertEqual(rt.schedule("a", "now", delay=0), 3)
+        self.assertEqual(rt.send("a", "plain2"), 4)
+
+    def test_delay_zero_enters_mailbox_immediately(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        rt.schedule("a", "immediate", delay=0, ttl=1)
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.scheduled_count("a"), 0)
+        rt.run()
+        self.assertEqual(rt.get_state("a"), ["immediate"])
+
+    def test_parked_message_waits_for_advance(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        msg_id = rt.schedule("a", "later", delay=3)
+        self.assertEqual(rt.pending_count("a"), 0)
+        self.assertEqual(rt.scheduled_count("a"), 1)
+        rt.run()  # run never releases parked messages
+        self.assertEqual(rt.get_state("a"), [])
+        result = rt.advance(2)
+        self.assertEqual(result.released, ())
+        self.assertEqual(rt.pending_count("a"), 0)
+        result = rt.advance(1)
+        self.assertEqual(result.released, (msg_id,))
+        self.assertEqual(result.expired, ())
+        self.assertEqual(rt.scheduled_count("a"), 0)
+        self.assertEqual(rt.pending_count("a"), 1)
+        rt.run()
+        self.assertEqual(rt.get_state("a"), ["later"])
+        self.assertEqual([e.message_id for e in rt.trace()], [msg_id])
+
+    def test_released_message_keeps_id_and_priority(self):
+        seen = []
+        rt = ActorRuntime()
+        rt.register("a", None, lambda s, m, c: (seen.append(m), s)[1])
+        rt.send("a", "plain-high", priority=5)
+        timed_id = rt.schedule("a", "timed-higher", delay=1, priority=9)
+        rt.send("a", "plain-low", priority=1)
+        rt.advance(1)
+        rt.run()
+        self.assertEqual(seen, ["timed-higher", "plain-high", "plain-low"])
+        self.assertEqual(rt.trace()[0].message_id, timed_id)
+        self.assertEqual(rt.trace()[0].priority, 9)
+
+    def test_expired_message_never_arrives(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        msg_id = rt.schedule("a", "doomed", delay=5, ttl=2)
+        result = rt.advance(2)
+        self.assertEqual(result.expired, (msg_id,))
+        self.assertEqual(result.released, ())
+        self.assertEqual(rt.scheduled_count("a"), 0)
+        self.assertEqual(rt.pending_count("a"), 0)
+        rt.run()
+        self.assertEqual(rt.get_state("a"), [])
+        self.assertEqual(rt.trace(), [])
+
+    def test_expiry_wins_over_release_at_same_tick(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        # Due and expired at the very same tick: expiry is judged first.
+        msg_id = rt.schedule("a", "doomed", delay=2, ttl=2)
+        result = rt.advance(2)
+        self.assertEqual(result.expired, (msg_id,))
+        self.assertEqual(result.released, ())
+        rt.run()
+        self.assertEqual(rt.get_state("a"), [])
+
+    def test_release_and_expiry_ordered_by_event_tick_then_id(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        # fire_at / expire_at pairs interleave across actors and ticks.
+        id1 = rt.schedule("a", "m1", delay=5)            # fires at 5
+        id2 = rt.schedule("a", "m2", delay=2, ttl=1)     # expires at 1
+        id3 = rt.schedule("a", "m3", delay=3)            # fires at 3
+        id4 = rt.schedule("a", "m4", delay=9, ttl=4)     # expires at 4
+        id5 = rt.schedule("a", "m5", delay=3)            # fires at 3
+        result = rt.advance(5)
+        self.assertEqual(result.now, 5)
+        # Released: tick 3 -> id3, id5; tick 5 -> id1.
+        self.assertEqual(result.released, (id3, id5, id1))
+        # Expired: tick 1 -> id2; tick 4 -> id4.
+        self.assertEqual(result.expired, (id2, id4))
+        self.assertEqual(rt.scheduled_count("a"), 0)
+
+    def test_schedule_validation(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        for bad in (1.0, "1", None, True):
+            with self.subTest(priority=bad):
+                with self.assertRaises(TypeError):
+                    rt.schedule("a", "m", delay=1, priority=bad)
+        for bad in (1.5, "1", None, True):
+            with self.subTest(delay=bad):
+                with self.assertRaises(TypeError):
+                    rt.schedule("a", "m", delay=bad)
+        with self.assertRaises(ValueError):
+            rt.schedule("a", "m", delay=-1)
+        for bad in (1.5, "1", True):
+            with self.subTest(ttl=bad):
+                with self.assertRaises(TypeError):
+                    rt.schedule("a", "m", delay=1, ttl=bad)
+        for bad in (0, -3):
+            with self.subTest(ttl=bad):
+                with self.assertRaises(ValueError):
+                    rt.schedule("a", "m", delay=1, ttl=bad)
+        # Nothing was scheduled and no id was consumed.
+        self.assertEqual(rt.scheduled_count("a"), 0)
+        self.assertEqual(rt.pending_count("a"), 0)
+        self.assertEqual(rt.schedule("a", "ok", delay=1), 1)
+
+    def test_schedule_unknown_target_raises(self):
+        rt = ActorRuntime()
+        with self.assertRaises(LookupError):
+            rt.schedule("ghost", "m", delay=1)
+
+    def test_scheduled_count_unknown_actor_raises(self):
+        with self.assertRaises(LookupError):
+            ActorRuntime().scheduled_count("ghost")
+
+    def test_schedule_copy_failure_consumes_no_id(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        self.assertEqual(rt.schedule("a", "ok", delay=1), 1)
+        boom = RuntimeError("no copy")
+
+        class Bad:
+            def __deepcopy__(self, memo):
+                raise boom
+
+        with self.assertRaises(ActorDataCopyError) as caught:
+            rt.schedule("a", Bad(), delay=1)
+        self.assertIs(caught.exception.original, boom)
+        self.assertEqual(rt.scheduled_count("a"), 1)
+        self.assertEqual(rt.schedule("a", "ok2", delay=1), 2)
+
+    def test_advance_validation_changes_nothing(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        rt.schedule("a", "parked", delay=2)
+        for bad in (1.0, "1", None, True):
+            with self.subTest(ticks=bad):
+                with self.assertRaises(TypeError):
+                    rt.advance(bad)
+        for bad in (0, -1):
+            with self.subTest(ticks=bad):
+                with self.assertRaises(ValueError):
+                    rt.advance(bad)
+        self.assertEqual(rt.now(), 0)
+        self.assertEqual(rt.scheduled_count("a"), 1)
+        self.assertEqual(rt.pending_count("a"), 0)
+
+    def test_advance_result_is_immutable(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        rt.schedule("a", "m", delay=1)
+        result = rt.advance(1)
+        self.assertIsInstance(result, AdvanceResult)
+        self.assertIsInstance(result.released, tuple)
+        self.assertIsInstance(result.expired, tuple)
+        with self.assertRaises(AttributeError):
+            result.now = 99
+
+
+class TimedDeterminismTests(unittest.TestCase):
+    def test_repeated_timed_scripts_identical(self):
+        def build_and_run():
+            rt = ActorRuntime()
+            rt.register("a", [], append_handler)
+            rt.register("b", [], append_handler)
+            returns = []
+            returns.append(rt.send("a", "plain", priority=1))
+            returns.append(rt.schedule("a", "t1", delay=2, priority=5))
+            returns.append(rt.schedule("b", "t2", delay=1, ttl=1))
+            returns.append(rt.schedule("b", "t3", delay=3))
+            r1 = rt.advance(2)
+            rt.run()
+            returns.append(rt.schedule("a", "t4", delay=0))
+            r2 = rt.advance(4)
+            rt.run()
+            return (
+                returns,
+                (r1.now, r1.released, r1.expired),
+                (r2.now, r2.released, r2.expired),
+                rt.now(),
+                rt.get_state("a"),
+                rt.get_state("b"),
+                rt.pending_count("a"),
+                rt.scheduled_count("a"),
                 [tuple(e) for e in rt.trace()],
             )
 
