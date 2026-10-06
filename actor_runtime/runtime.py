@@ -127,8 +127,10 @@ class ActorContext:
         inside the handler aborts the current processing exactly like any
         other handler exception.
         """
-        if target not in self._runtime._actors:
-            raise LookupError(f"unknown actor: {target!r}")
+        # Only the target is validated here, mirroring the lookup step of the
+        # runtime's delivery boundary; validation/copy/numbering/commit of the
+        # buffered message happen together when the handler succeeds.
+        self._runtime._validate_context_target(target)
         self._pending.append((target, message))
 
 
@@ -141,6 +143,11 @@ def _copy_data(what: str, value: Any) -> Any:
         return copy.deepcopy(value)
     except Exception as exc:
         raise ActorDataCopyError(what, exc) from exc
+
+
+def _is_plain_int(value: Any) -> bool:
+    """A real integer, rejecting ``bool`` (which is an ``int`` subclass)."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 class _Actor:
@@ -211,6 +218,22 @@ class ActorRuntime:
         )
 
     # -- delivery ---------------------------------------------------------
+    #
+    # Every entry point funnels through the same private submission boundary:
+    #
+    #   1. validate   argument types/ranges, in the fixed order each entry
+    #                  point documents;
+    #   2. resolve    target actor and (for send_once) dedup state; a
+    #                  duplicate short-circuits here without copying;
+    #   3. copy       the message into a private deep copy, before any id or
+    #                  reservation is taken;
+    #   4. number     draw the next id from the single runtime-wide sequence;
+    #   5. commit     pure runtime bookkeeping (mailbox push / scheduled queue
+    #                  / dedup reservation), which cannot fail on user data.
+    #
+    # send, send_once and schedule take the eager boundary (their copy is the
+    # message). ActorContext.send is buffered at step 2 and takes the same
+    # boundary later, inside run, only once the handler has succeeded.
 
     def send(self, target: str, message: Any, priority: int = 0) -> int:
         """Deliver a message to ``target``'s mailbox and return its id.
@@ -222,17 +245,11 @@ class ActorRuntime:
         :class:`ActorDataCopyError` if ``message`` cannot be deep-copied;
         a failed delivery consumes no id and changes no mailbox.
         """
-        if not isinstance(priority, int) or isinstance(priority, bool):
-            raise TypeError("priority must be an integer")
-        actor = self._actors.get(target)
-        if actor is None:
-            raise LookupError(f"unknown actor: {target!r}")
-        # Copy before assigning an id: a failed copy leaves the mailbox,
-        # the trace, the actor state and the next message id untouched.
+        self._validate_priority(priority)
+        actor = self._resolve_actor(target)
         stored = _copy_data("message", message)
-        message_id = self._next_message_id
-        self._next_message_id += 1
-        heapq.heappush(actor.mailbox, (-priority, message_id, stored))
+        message_id = self._draw_id()
+        self._commit_mail(actor, message_id, priority, stored)
         return message_id
 
     def send_once(self, target: str, delivery_key: str, message: Any,
@@ -266,28 +283,19 @@ class ActorRuntime:
         is reserved, no id is consumed and nothing is enqueued, so after
         fixing the data the same key can be used to retry.
         """
-        if not isinstance(priority, int) or isinstance(priority, bool):
-            raise TypeError("priority must be an integer")
-        if not isinstance(delivery_key, str):
-            raise TypeError("delivery_key must be a string")
-        if delivery_key == "":
-            raise ValueError("delivery_key must be a non-empty string")
-        actor = self._actors.get(target)
-        if actor is None:
-            raise LookupError(f"unknown actor: {target!r}")
+        self._validate_priority(priority)
+        self._validate_delivery_key(delivery_key)
+        actor = self._resolve_actor(target)
         existing = actor.dedup_keys.get(delivery_key)
         if existing is not None:
             # Duplicate confirmation: the placeholder message is neither
             # copied nor compared, nothing is enqueued and no id consumed.
             return DedupResult(existing, False)
-        # Copy before reserving the key or consuming an id, mirroring send:
-        # a failed copy leaves the key free, so the corrected call is the
-        # first accepted delivery for it.
         stored = _copy_data("message", message)
-        message_id = self._next_message_id
-        self._next_message_id += 1
+        message_id = self._draw_id()
+        # Reserve the key and enqueue as one non-failing commit.
         actor.dedup_keys[delivery_key] = message_id
-        heapq.heappush(actor.mailbox, (-priority, message_id, stored))
+        self._commit_mail(actor, message_id, priority, stored)
         return DedupResult(message_id, True)
 
     def schedule(self, target: str, message: Any, delay: int,
@@ -309,40 +317,92 @@ class ActorRuntime:
         cannot be deep-copied; a failed schedule consumes no id and queues
         nothing.
         """
-        if not isinstance(priority, int) or isinstance(priority, bool):
-            raise TypeError("priority must be an integer")
-        if not isinstance(delay, int) or isinstance(delay, bool):
-            raise TypeError("delay must be an integer")
-        if delay < 0:
-            raise ValueError("delay must be a non-negative integer")
-        if ttl is not None and (
-            not isinstance(ttl, int) or isinstance(ttl, bool)
-        ):
-            raise TypeError("ttl must be None or an integer")
-        if ttl is not None and ttl <= 0:
-            raise ValueError("ttl must be a positive integer or None")
-        actor = self._actors.get(target)
-        if actor is None:
-            raise LookupError(f"unknown actor: {target!r}")
-        # Copy before assigning an id: a failed copy queues nothing and
-        # consumes no id, exactly like send.
+        self._validate_priority(priority)
+        self._validate_delay(delay)
+        self._validate_ttl(ttl)
+        actor = self._resolve_actor(target)
         stored = _copy_data("message", message)
-        message_id = self._next_message_id
-        self._next_message_id += 1
+        message_id = self._draw_id()
         scheduled_at = self._clock
         release_at = scheduled_at + delay
         expire_at = None if ttl is None else scheduled_at + ttl
         if delay == 0:
             # ttl is a strictly positive integer, so a zero-delay delivery is
             # never already expired: it enters the mailbox straight away.
-            heapq.heappush(actor.mailbox, (-priority, message_id, stored))
+            self._commit_mail(actor, message_id, priority, stored)
         else:
-            self._scheduled.append(
-                _ScheduledDelivery(
-                    message_id, actor, priority, stored,
-                    scheduled_at, release_at, expire_at,
-                )
+            self._commit_scheduled(
+                actor, message_id, priority, stored,
+                scheduled_at, release_at, expire_at,
             )
+        return message_id
+
+    # -- private submission boundary --------------------------------------
+
+    def _validate_priority(self, priority: Any) -> None:
+        if not _is_plain_int(priority):
+            raise TypeError("priority must be an integer")
+
+    def _validate_delivery_key(self, delivery_key: Any) -> None:
+        if not isinstance(delivery_key, str):
+            raise TypeError("delivery_key must be a string")
+        if delivery_key == "":
+            raise ValueError("delivery_key must be a non-empty string")
+
+    def _validate_delay(self, delay: Any) -> None:
+        if not _is_plain_int(delay):
+            raise TypeError("delay must be an integer")
+        if delay < 0:
+            raise ValueError("delay must be a non-negative integer")
+
+    def _validate_ttl(self, ttl: Any) -> None:
+        if ttl is None:
+            return
+        if not _is_plain_int(ttl):
+            raise TypeError("ttl must be None or an integer")
+        if ttl <= 0:
+            raise ValueError("ttl must be a positive integer or None")
+
+    def _resolve_actor(self, target: str) -> _Actor:
+        actor = self._actors.get(target)
+        if actor is None:
+            raise LookupError(f"unknown actor: {target!r}")
+        return actor
+
+    def _validate_context_target(self, target: str) -> None:
+        # The context path performs only the lookup while the handler runs;
+        # every other check is shared at commit time.
+        self._resolve_actor(target)
+
+    def _draw_id(self) -> int:
+        message_id = self._next_message_id
+        self._next_message_id += 1
+        return message_id
+
+    def _commit_mail(self, actor: _Actor, message_id: int, priority: int,
+                     stored: Any) -> None:
+        """Push an already-copied message under an already-assigned id."""
+        heapq.heappush(actor.mailbox, (-priority, message_id, stored))
+
+    def _commit_scheduled(self, actor: _Actor, message_id: int, priority: int,
+                          stored: Any, scheduled_at: int, release_at: int,
+                          expire_at: int | None) -> None:
+        self._scheduled.append(
+            _ScheduledDelivery(
+                message_id, actor, priority, stored,
+                scheduled_at, release_at, expire_at,
+            )
+        )
+
+    def _commit_derived(self, target: str, stored: Any) -> int:
+        """Number and enqueue one copied buffered message at priority 0.
+
+        Targets were resolved when the handler buffered them, so this is pure
+        runtime bookkeeping that cannot fail on user data. Ids are drawn here
+        in buffering order, which makes the derived ids a continuous run.
+        """
+        message_id = self._draw_id()
+        self._commit_mail(self._actors[target], message_id, 0, stored)
         return message_id
 
     # -- logical clock ----------------------------------------------------
@@ -365,7 +425,7 @@ class ActorRuntime:
         Releasing never invokes a handler and never writes a trace entry; use
         :meth:`run` afterwards to process the mail.
         """
-        if not isinstance(ticks, int) or isinstance(ticks, bool):
+        if not _is_plain_int(ticks):
             raise TypeError("ticks must be an integer")
         if ticks <= 0:
             raise ValueError("ticks must be a positive integer")
@@ -393,10 +453,9 @@ class ActorRuntime:
                 # ttl elapses at a later tick inside the same jump, the
                 # delivery was released at its deadline and is ordinary
                 # mailbox mail from then on; the ttl only guards the wait.
-                heapq.heappush(
-                    delivery.actor.mailbox,
-                    (-delivery.priority, delivery.message_id,
-                     delivery.message),
+                self._commit_mail(
+                    delivery.actor, delivery.message_id,
+                    delivery.priority, delivery.message,
                 )
                 released.append((delivery.release_at, delivery.message_id))
                 continue
@@ -428,7 +487,7 @@ class ActorRuntime:
         Returns the number of messages completed by this call.
         """
         if limit is not None and (
-            not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+            not _is_plain_int(limit) or limit <= 0
         ):
             raise ValueError("limit must be a positive integer or None")
 
@@ -496,13 +555,13 @@ class ActorRuntime:
                 raise
 
             # Commit: only runtime-owned bookkeeping below, so nothing here
-            # can fail because of user data. Derived sends enqueue only
-            # after successful completion.
+            # can fail because of user data. The buffered derived messages
+            # now cross the same boundary as an external send -- continuous
+            # ids in buffering order, fixed priority 0 (they never inherit
+            # the handling message's priority) -- and become visible only
+            # after this handler's successful completion.
             for derived_target, stored in staged:
-                derived_id = self._next_message_id
-                self._next_message_id += 1
-                derived_actor = self._actors[derived_target]
-                heapq.heappush(derived_actor.mailbox, (0, derived_id, stored))
+                self._commit_derived(derived_target, stored)
 
             actor.state = committed_state
             self._trace.append(
