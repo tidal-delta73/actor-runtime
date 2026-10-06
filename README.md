@@ -83,6 +83,48 @@ rt.run()                            # advance never invokes a handler
   `ActorDataCopyError` and consumes no id. Any failed `schedule`/`advance`
   leaves the clock, the id counter and every queue untouched.
 
+### Idempotent delivery (at-least-once protection)
+
+`send_once(target, delivery_key, message, priority=0)` makes a delivery
+idempotent on the `(target, delivery_key)` pair. The key scope is the target
+actor, so different actors may reuse the same key freely. Plain `send`
+deliveries never participate in deduplication.
+
+```python
+first = rt.send_once("counter", "order-42", {"n": 1})
+# DedupResult(message_id=1, accepted=True) — same copy/id/priority rules as send
+again = rt.send_once("counter", "order-42", {"n": 999})
+# DedupResult(message_id=1, accepted=False) — placeholder message is never
+# copied or compared; nothing is re-enqueued and no id is consumed.
+rt.send_once("other", "order-42", {"n": 1})  # accepted: other actor, same key
+```
+
+- The first call for a pair deep-copies the message, takes the next
+  runtime-wide monotonic id, enqueues it by the existing priority rules and
+  returns `DedupResult(message_id, accepted=True)`.
+- Every later call with the same target and key returns the **first** id with
+  `accepted=False`, whether the first message is still pending, has already
+  completed or is waiting in the mailbox for retry after a handler failure.
+  It changes no state, trace entry or the original delivery's priority, and
+  its `message` argument is never copied or compared.
+- The dedup record is reserved at acceptance and lives for the whole lifetime
+  of the runtime instance. If the first handler fails, the existing
+  `ActorExecutionError` / message-stays-in-mailbox / transactional rollback
+  contract applies unchanged and the key reservation is **not** withdrawn:
+  re-submitting the same key only confirms the duplicate, while a later `run`
+  retries the original message. A successful processing therefore produces at
+  most one `TraceEntry`.
+- Validation: `priority` that is not a non-boolean integer raises
+  `TypeError`; a non-string `delivery_key` raises `TypeError` and an empty one
+  raises `ValueError`; an unknown target raises `LookupError`. All of these
+  checks run before the duplicate record is consulted. If the first message
+  cannot be deep-copied, `ActorDataCopyError` is raised with no key reserved
+  and no id consumed — after fixing the data, the same key can be retried as
+  the first delivery.
+- Determinism: for the same registrations, idempotent calls and `run` order,
+  independent runtimes produce identical `DedupResult` sequences, final
+  states and completion traces.
+
 ### Semantics
 
 - An actor is a unique non-empty string name, an initial state and a handler
@@ -93,6 +135,14 @@ rt.run()                            # advance never invokes a handler
   targets raise `LookupError`; non-integer priority raises `TypeError`; a
   message that cannot be deep-copied raises `ActorDataCopyError`.
   Failed deliveries consume no id.
+- `send_once(target, delivery_key, message, priority=0)` is the idempotent
+  variant: dedup is scoped to the `(target, delivery_key)` pair for the whole
+  runtime lifetime, and it returns an immutable
+  `DedupResult(message_id, accepted)` distinguishing the first acceptance
+  from a duplicate confirmation. Plain `send`, `schedule`, `ctx.send`,
+  mailbox selection, timed release/expiry, read-only queries and failure
+  atomicity keep their current behaviour; ordinary deliveries do not
+  deduplicate.
 - Scheduling: the actor with the earliest registration order and a non-empty
   mailbox is selected; within a mailbox, higher priority wins, then lower
   message id. Messages a handler sends through `ctx.send` are enqueued only

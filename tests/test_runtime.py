@@ -7,6 +7,7 @@ from actor_runtime import (
     ActorDataCopyError,
     ActorExecutionError,
     ActorRuntime,
+    DedupResult,
     TraceEntry,
 )
 
@@ -676,6 +677,275 @@ class TraceTests(unittest.TestCase):
         payload.append(3)
         rt.run()
         self.assertEqual(rt.get_state("a"), [1, 2])
+
+
+class SendOnceDedupTests(unittest.TestCase):
+    """Idempotent delivery via send_once / DedupResult."""
+
+    @staticmethod
+    def make_uncopyable(boom=RuntimeError("no copy")):
+        class Bad:
+            def __deepcopy__(self, memo):
+                raise boom
+
+            def __eq__(self, other):
+                raise AssertionError("duplicate placeholder must not be compared")
+
+        return Bad
+
+    def test_first_call_accepted_like_send(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        result = rt.send_once("a", "key-1", "hello", priority=3)
+        self.assertEqual(result, DedupResult(1, True))
+        self.assertIsInstance(result, DedupResult)
+        self.assertEqual(rt.pending_count("a"), 1)
+        rt.run()
+        self.assertEqual(rt.get_state("a"), ["hello"])
+        self.assertEqual(
+            [tuple(e) for e in rt.trace()],
+            [(1, "a", 3, [], ["hello"])],
+        )
+
+    def test_dedup_result_is_immutable(self):
+        result = DedupResult(7, True)
+        self.assertEqual((result.message_id, result.accepted), (7, True))
+        with self.assertRaises(AttributeError):
+            result.accepted = False
+
+    def test_duplicate_while_pending_confirms_first_id(self):
+        rt = ActorRuntime()
+        rt.register("a", None, noop_handler)
+        first = rt.send_once("a", "k", "first")
+        self.assertEqual(first, DedupResult(1, True))
+        # The placeholder must not be copied or compared.
+        dup = rt.send_once("a", "k", self.make_uncopyable()(), priority=9)
+        self.assertEqual(dup, DedupResult(1, False))
+        # Nothing re-enqueued, no id consumed, priority of the original kept.
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.send("a", "plain"), 2)
+        rt.run()
+        self.assertEqual(
+            [(t.message_id, t.priority) for t in rt.trace()],
+            [(1, 0), (2, 0)],
+        )
+
+    def test_duplicate_message_never_reaches_handler(self):
+        seen = []
+        rt = ActorRuntime()
+        rt.register("a", None, lambda s, m, c: (seen.append(m), s)[1])
+        rt.send_once("a", "k", {"v": 1})
+        rt.send_once("a", "k", {"v": 2})
+        rt.send_once("a", "k", {"v": 3})
+        rt.run()
+        self.assertEqual(seen, [{"v": 1}])
+        self.assertEqual(len(rt.trace()), 1)
+
+    def test_duplicate_after_completion_still_confirms(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        first = rt.send_once("a", "k", "m1")
+        rt.run()
+        dup = rt.send_once("a", "k", self.make_uncopyable()())
+        self.assertEqual(dup.message_id, first.message_id)
+        self.assertFalse(dup.accepted)
+        self.assertEqual(rt.pending_count("a"), 0)
+        self.assertEqual(rt.get_state("a"), ["m1"])
+        self.assertEqual(len(rt.trace()), 1)
+        # Dedup record lives for the whole runtime lifetime.
+        self.assertEqual(rt.send_once("a", "k", "m2"), DedupResult(1, False))
+
+    def test_duplicate_while_waiting_failure_retry_keeps_reservation(self):
+        flag = {"fail": True}
+
+        def handler(state, message, ctx):
+            if flag["fail"]:
+                raise RuntimeError("boom")
+            return list(state) + [message]
+
+        rt = ActorRuntime()
+        rt.register("a", [], handler)
+        first = rt.send_once("a", "k", "original")
+        self.assertEqual(first, DedupResult(1, True))
+        with self.assertRaises(ActorExecutionError) as caught:
+            rt.run()
+        self.assertEqual(caught.exception.message_id, 1)
+        # Key reservation survives the rollback: re-submit only confirms the
+        # duplicate, the original stays pending and no id is consumed.
+        dup = rt.send_once("a", "k", self.make_uncopyable()())
+        self.assertEqual(dup, DedupResult(1, False))
+        self.assertEqual(rt.pending_count("a"), 1)
+        self.assertEqual(rt.send("a", "plain"), 2)
+        self.assertEqual(rt.trace(), [])
+        # The later run retries the original message; at most one trace entry
+        # is ever produced for the idempotent delivery.
+        flag["fail"] = False
+        rt.run()
+        self.assertEqual(rt.get_state("a"), ["original", "plain"])
+        self.assertEqual(
+            [(t.message_id, t.actor_name) for t in rt.trace()],
+            [(1, "a"), (2, "a")],
+        )
+        self.assertEqual(rt.send_once("a", "k", "again"), DedupResult(1, False))
+
+    def test_dedup_scope_is_target_and_key(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        rt.register("b", [], append_handler)
+        self.assertEqual(rt.send_once("a", "shared", "x"), DedupResult(1, True))
+        self.assertEqual(rt.send_once("b", "shared", "x"), DedupResult(2, True))
+        self.assertEqual(rt.send_once("a", "shared", "y"), DedupResult(1, False))
+        self.assertEqual(rt.send_once("b", "shared", "y"), DedupResult(2, False))
+        rt.run()
+        self.assertEqual(rt.get_state("a"), ["x"])
+        self.assertEqual(rt.get_state("b"), ["x"])
+
+    def test_distinct_keys_distinct_deliveries(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        self.assertEqual(rt.send_once("a", "k1", "a"), DedupResult(1, True))
+        self.assertEqual(rt.send_once("a", "k2", "b"), DedupResult(2, True))
+        self.assertEqual(rt.send_once("a", "k1", "c"), DedupResult(1, False))
+        self.assertEqual(rt.pending_count("a"), 2)
+
+    def test_ids_interleave_with_send_on_global_sequence(self):
+        rt = ActorRuntime()
+        rt.register("a", None, noop_handler)
+        self.assertEqual(rt.send("a", "p"), 1)
+        self.assertEqual(rt.send_once("a", "k", "m"), DedupResult(2, True))
+        self.assertEqual(rt.send_once("a", "k", "m"), DedupResult(2, False))
+        self.assertEqual(rt.send("a", "p2"), 3)
+
+    def test_duplicate_keeps_original_priority(self):
+        seen = []
+        rt = ActorRuntime()
+        rt.register("a", None, lambda s, m, c: (seen.append(m), s)[1])
+        rt.send_once("a", "high", "high", priority=10)
+        rt.send_once("a", "high", "ignored", priority=0)  # dup, no re-enqueue
+        rt.send_once("a", "low", "low", priority=0)
+        rt.run()
+        self.assertEqual(seen, ["high", "low"])
+        self.assertEqual(
+            [t.priority for t in rt.trace()], [10, 0]
+        )
+
+    def test_first_call_copies_message_and_isolates_caller(self):
+        payload = [1, 2]
+        rt = ActorRuntime()
+        rt.register("a", None, lambda s, m, c: m)
+        result = rt.send_once("a", "k", payload)
+        self.assertTrue(result.accepted)
+        payload.append(3)
+        rt.run()
+        self.assertEqual(rt.get_state("a"), [1, 2])
+
+    def test_priority_validation(self):
+        rt = ActorRuntime()
+        rt.register("a", None, noop_handler)
+        rt.send_once("a", "k", "m")
+        for bad in (1.0, "1", None, [1], True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    rt.send_once("a", "k", "m", priority=bad)
+
+    def test_delivery_key_must_be_non_empty_string(self):
+        rt = ActorRuntime()
+        rt.register("a", None, noop_handler)
+        for bad in (1, 1.0, None, b"k", ["k"], object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    rt.send_once("a", bad, "m")
+        with self.assertRaises(ValueError):
+            rt.send_once("a", "", "m")
+
+    def test_unknown_target_raises_lookup_error(self):
+        rt = ActorRuntime()
+        with self.assertRaises(LookupError):
+            rt.send_once("ghost", "k", "m")
+
+    def test_validation_order_precedes_dedup_lookup(self):
+        rt = ActorRuntime()
+        rt.register("a", None, noop_handler)
+        rt.send_once("a", "k", "m")
+        # Priority is checked first, even with a non-string key.
+        with self.assertRaises(TypeError):
+            rt.send_once("a", 123, "m", priority=1.5)
+        # Key type/emptiness is checked before the target exists.
+        with self.assertRaises(TypeError):
+            rt.send_once("ghost", 123, "m")
+        with self.assertRaises(ValueError):
+            rt.send_once("ghost", "", "m")
+        # An existing key is still subject to priority validation, and a
+        # rejected call changes nothing.
+        with self.assertRaises(TypeError):
+            rt.send_once("a", "k", "m", priority=True)
+        self.assertEqual(rt.send_once("a", "k", "m"), DedupResult(1, False))
+
+    def test_copy_failure_on_first_reserves_no_key_consumes_no_id(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        boom = RuntimeError("no copy")
+
+        class Bad:
+            def __deepcopy__(self, memo):
+                raise boom
+
+        with self.assertRaises(ActorDataCopyError) as caught:
+            rt.send_once("a", "k", Bad())
+        self.assertIs(caught.exception.original, boom)
+        self.assertEqual(rt.pending_count("a"), 0)
+        # No id consumed.
+        self.assertEqual(rt.send("a", "plain"), 1)
+        # Same key is still free: corrected retry is the first acceptance.
+        self.assertEqual(rt.send_once("a", "k", "fixed"), DedupResult(2, True))
+        rt.run()
+        self.assertEqual(rt.get_state("a"), ["plain", "fixed"])
+
+    def test_plain_send_does_not_deduplicate(self):
+        rt = ActorRuntime()
+        rt.register("a", [], append_handler)
+        self.assertEqual(rt.send_once("a", "k", "once"), DedupResult(1, True))
+        self.assertEqual(rt.send("a", "once"), 2)
+        self.assertEqual(rt.send("a", "once"), 3)
+        rt.run()
+        self.assertEqual(rt.get_state("a"), ["once", "once", "once"])
+
+    def test_determinism_across_independent_runtimes(self):
+        def build_and_run():
+            rt = ActorRuntime()
+
+            def handler(state, message, ctx):
+                return list(state) + [message]
+
+            rt.register("a", [], handler)
+            rt.register("b", [], handler)
+            results = []
+            results.append(rt.send_once("a", "k1", "a1", priority=5))
+            results.append(rt.send("b", "seed"))
+            results.append(rt.send_once("a", "k1", "dup"))
+            results.append(rt.send_once("b", "k1", "b1"))
+            results.append(rt.send_once("a", "k2", "a2"))
+            results.append(rt.send_once("b", "k1", "dup"))
+            rt.run()
+            results.append(rt.send_once("a", "k2", "late-dup"))
+            return (
+                [
+                    tuple(r) if isinstance(r, DedupResult) else (r, None)
+                    for r in results
+                ],
+                copy.deepcopy(rt.get_state("a")),
+                copy.deepcopy(rt.get_state("b")),
+                [tuple(e) for e in rt.trace()],
+            )
+
+        first = build_and_run()
+        for _ in range(3):
+            self.assertEqual(build_and_run(), first)
+        expected_results = [
+            (1, True), (2, None), (1, False), (3, True),
+            (4, True), (3, False), (4, False),
+        ]
+        self.assertEqual(first[0], expected_results)
 
 
 class DeterminismTests(unittest.TestCase):
