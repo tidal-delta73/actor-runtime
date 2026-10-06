@@ -42,6 +42,47 @@ rt.pending_count("counter")
 rt.trace()                # list of TraceEntry, in completion order
 ```
 
+### Logical clock and timed delivery
+
+Time is an explicitly replayed input, never wall-clock time: a logical clock
+starts at 0 and only moves when `advance` is called.
+
+```python
+rt.clock()                          # -> 0, the current logical tick
+mid = rt.schedule("counter", "later", delay=5, ttl=10, priority=0)
+# mid comes from the same runtime-wide monotonic sequence as send.
+# delay: ticks from the current tick until the message is released.
+# ttl:   optional ticks (measured from scheduling) the delivery stays alive;
+#        None (the default) means it never expires.
+
+result = rt.advance(5)              # AdvanceResult(time=5, released=(mid,), expired=())
+# result.released / result.expired are immutable tuples of message ids,
+# stably ordered by the tick the event happened at and then by message id.
+rt.pending_count("counter")         # released mail is ordinary mailbox mail
+rt.scheduled_count("counter")       # deliveries neither released nor expired
+rt.run()                            # advance never invokes a handler
+```
+
+- `delay=0` releases immediately into the mailbox; `schedule` itself never
+  moves the clock, and neither does `run`.
+- A delivery is released when `now >= scheduled_at + delay`; it expires when
+  `now >= scheduled_at + ttl`. When both happen on the same tick, expiry is
+  decided first, so the message never enters a mailbox or reaches a handler.
+  A delivery already released is ordinary mail — a later ttl tick does not
+  remove it.
+- Released messages keep the id returned by `schedule` and their scheduled
+  priority, so they participate in the usual registration-order /
+  priority / id scheduling. They only enter the trace after a successful
+  `run`, exactly like `send` messages; expired messages produce no handler
+  call, no trace entry and no state change.
+- Validation: `priority` must be a non-boolean integer (`TypeError`
+  otherwise); `delay` must be a non-boolean non-negative integer
+  (`TypeError`/`ValueError`); `ttl` must be `None` or a non-boolean positive
+  integer; `advance` takes a non-boolean positive integer. Unknown targets
+  raise `LookupError`; an uncopyable scheduled message raises
+  `ActorDataCopyError` and consumes no id. Any failed `schedule`/`advance`
+  leaves the clock, the id counter and every queue untouched.
+
 ### Semantics
 
 - An actor is a unique non-empty string name, an initial state and a handler
@@ -73,7 +114,8 @@ rt.trace()                # list of TraceEntry, in completion order
   and `state_after`.
 
 Only single-process in-memory semantics are provided: no persistence,
-supervision, timed messages or parallel scheduling.
+supervision or parallel scheduling. Time is logical and only advances via
+explicit `advance` calls — there is no wall-clock access and no threads.
 
 ## Tests
 
