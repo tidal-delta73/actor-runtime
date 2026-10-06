@@ -163,6 +163,47 @@ rt.send_once("other", "order-42", {"n": 1})  # accepted: other actor, same key
   `TraceEntry` has `message_id`, `actor_name`, `priority`, `state_before`
   and `state_after`.
 
+### Deterministic snapshots and recovery
+
+`export_snapshot()` serialises the whole observable runtime into
+deterministic `bytes`, and `ActorRuntime.restore_snapshot(data, handlers)`
+builds a fresh runtime from those bytes plus a mapping of actor name to
+handler. Handlers (and any executable code) are never serialised; recovery
+imports nothing and executes no object carried by the snapshot.
+
+```python
+blob = rt.export_snapshot()                       # persist these bytes
+rt2 = ActorRuntime.restore_snapshot(
+    blob, {"counter": counter, "logger": logger}, # extras are ignored
+)
+```
+
+The snapshot captures: actor registration order and current state; every
+mailbox's unacknowledged messages with priority and message id; timed
+deliveries neither released nor expired, with their original release/expiry
+ticks; each `send_once` key's first message id; the logical clock; the next
+message id; and the complete completion trace. Restored read-only queries
+return independent copies immediately, old idempotent keys keep returning
+their original id with `accepted=False`, new deliveries continue from the
+saved next id, restored timers still release/expire at their original
+deadlines (same-tick events stay id-sorted), and `run` keeps its
+registration-order, priority, failure-rollback and derived-mail rules.
+
+Snapshots are canonical JSON: equal observable states produce byte-for-byte
+identical bytes regardless of mapping insertion order (signed zero is
+canonicalised to `0.0`). Business data is limited to `None`, booleans,
+integers, finite floats, strings, `bytes`, and recursively nested `list`,
+`tuple` and string-keyed `dict`. Sets, custom instances, non-string mapping
+keys, NaN/infinite floats and cyclic containers make `export_snapshot` raise
+`SnapshotError`; export is a pure read, so the source runtime — mailboxes,
+timers, clock, dedup records, trace and id counter — is unchanged. On
+restore, truncated, tampered, unsupported-version, field-missing or
+internally inconsistent bytes raise `SnapshotError`; a missing handler for
+any snapshot actor raises `LookupError` (extras are ignored). Either failure
+occurs before a runtime exists, so a partially restored runtime can never be
+observed. Existing entry points and exception types are unchanged when
+snapshots are not used.
+
 Only single-process in-memory semantics are provided: no persistence,
 supervision or parallel scheduling. Time is logical and only advances via
 explicit `advance` calls — there is no wall-clock access and no threads.

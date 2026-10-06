@@ -16,7 +16,16 @@ from __future__ import annotations
 
 import copy
 import heapq
+from collections.abc import Mapping
 from typing import Any, Callable, NamedTuple
+
+from ._snapshot import (
+    SNAPSHOT_VERSION,
+    SnapshotError,
+    canonical_dumps,
+    decode_snapshot,
+    encode_value,
+)
 
 __all__ = [
     "ActorContext",
@@ -25,6 +34,7 @@ __all__ = [
     "ActorRuntime",
     "AdvanceResult",
     "DedupResult",
+    "SnapshotError",
     "TraceEntry",
 ]
 
@@ -616,3 +626,167 @@ class ActorRuntime:
         it or the states inside entries cannot affect the runtime.
         """
         return copy.deepcopy(self._trace)
+
+    # -- deterministic snapshot and recovery ------------------------------
+
+    def export_snapshot(self) -> bytes:
+        """Export the whole observable runtime as deterministic bytes.
+
+        The snapshot captures registration order and every actor's current
+        state, each mailbox's unacknowledged messages (with priority and
+        message id), timed deliveries neither released nor expired (with
+        their original deadlines), every ``send_once`` key's first message
+        id, the logical clock, the next message id and the completion trace.
+        Handlers and all other executable objects are deliberately *not*
+        serialised: they are re-supplied at recovery time.
+
+        Business data may be ``None``, booleans, integers, finite floats,
+        strings, bytes and recursively nested lists, tuples and
+        string-keyed dicts. Two mappings that differ only in key insertion
+        order produce identical bytes, and so do two runtimes with
+        identical observable states.
+
+        Raises :class:`SnapshotError` for unsupported data -- sets, custom
+        instances, non-string mapping keys, NaN/infinite floats or cyclic
+        containers. Export is read-only: on failure (or success) the
+        mailboxes, scheduled queue, clock, dedup records, trace and id
+        counter are exactly as before.
+        """
+        actors_payload = []
+        for actor in self._actors.values():  # registration/insertion order
+            # The heap stores (-priority, id, message); sorting it yields the
+            # canonical pop order. The stored message never participates in
+            # the comparison because every message id is unique.
+            actors_payload.append({
+                "name": actor.name,
+                "order": actor.order,
+                "state": encode_value(actor.state),
+                "mailbox": [
+                    [-neg_priority, message_id, encode_value(message)]
+                    for neg_priority, message_id, message
+                    in sorted(actor.mailbox)
+                ],
+                "dedup": dict(actor.dedup_keys),
+            })
+
+        scheduled_payload = [
+            {
+                "id": delivery.message_id,
+                "actor": delivery.actor.name,
+                "priority": delivery.priority,
+                "message": encode_value(delivery.message),
+                "release_at": delivery.release_at,
+                "expire_at": delivery.expire_at,
+            }
+            # _scheduled is kept in scheduling (message-id) order, which is
+            # also the order the decoder requires. Only deadlines are
+            # serialised: scheduled_at is invisible to every public query,
+            # so including it would distinguish otherwise identical runtimes.
+            for delivery in self._scheduled
+        ]
+
+        trace_payload = [
+            {
+                "id": entry.message_id,
+                "actor": entry.actor_name,
+                "priority": entry.priority,
+                "state_before": encode_value(entry.state_before),
+                "state_after": encode_value(entry.state_after),
+            }
+            # Completion order, never reordered.
+            for entry in self._trace
+        ]
+
+        document = {
+            "v": SNAPSHOT_VERSION,
+            "clock": self._clock,
+            "next_id": self._next_message_id,
+            "actors": actors_payload,
+            "scheduled": scheduled_payload,
+            "trace": trace_payload,
+        }
+        return canonical_dumps(document)
+
+    @classmethod
+    def restore_snapshot(
+        cls, data: bytes, handlers: Mapping[str, Handler]
+    ) -> "ActorRuntime":
+        """Create a new runtime from :meth:`export_snapshot` bytes.
+
+        ``handlers`` maps every actor named in the snapshot to a handler;
+        handlers are never read from the bytes, nothing is imported and no
+        snapshot-carried object is executed. A missing handler for any
+        snapshot actor raises :class:`LookupError`; extra mappings are
+        ignored. Truncated, tampered, unsupported, incomplete or internally
+        inconsistent bytes raise :class:`SnapshotError`. Either failure
+        raises before a runtime exists, so a partially restored runtime can
+        never be observed.
+
+        The restored runtime reports the snapshot's states, mailboxes
+        (priority and id included), pending timers (original deadlines),
+        dedup records, clock, trace and next message id; read-only queries
+        return independent copies as usual.
+        """
+        payload = decode_snapshot(data)  # SnapshotError on any bad byte
+
+        if not isinstance(handlers, Mapping):
+            raise TypeError("handlers must be a mapping of actor name to handler")
+
+        # Validate the whole handler map before constructing anything, so a
+        # missing name fails atomically with no half-built runtime.
+        missing = [
+            actor["name"] for actor in payload["actors"]
+            if actor["name"] not in handlers
+        ]
+        if missing:
+            raise LookupError(
+                f"no handler supplied for snapshot actor(s): "
+                f"{', '.join(repr(name) for name in missing)}"
+            )
+
+        runtime = cls()
+        restored: dict[str, _Actor] = {}
+        for actor_data in payload["actors"]:
+            actor = _Actor(
+                name=actor_data["name"],
+                state=actor_data["state"],
+                handler=handlers[actor_data["name"]],
+                order=actor_data["order"],
+            )
+            # Entries arrive already in canonical (-priority, id) order;
+            # heapify rebuilds the heap invariant without reordering ids.
+            actor.mailbox = [
+                (-priority, message_id, message)
+                for priority, message_id, message in actor_data["mailbox"]
+            ]
+            heapq.heapify(actor.mailbox)
+            actor.dedup_keys = dict(actor_data["dedup"])
+            restored[actor.name] = actor
+        runtime._actors = restored
+        runtime._clock = payload["clock"]
+        runtime._next_message_id = payload["next_id"]
+        runtime._scheduled = [
+            _ScheduledDelivery(
+                message_id=delivery["id"],
+                actor=restored[delivery["actor"]],
+                priority=delivery["priority"],
+                message=delivery["message"],
+                # scheduled_at is unobservable; attribute the delivery to
+                # the snapshot tick with its remaining delay/ttl.
+                scheduled_at=runtime._clock,
+                release_at=delivery["release_at"],
+                expire_at=delivery["expire_at"],
+            )
+            for delivery in payload["scheduled"]
+        ]
+        runtime._trace = [
+            TraceEntry(
+                message_id=entry["id"],
+                actor_name=entry["actor"],
+                priority=entry["priority"],
+                state_before=entry["state_before"],
+                state_after=entry["state_after"],
+            )
+            for entry in payload["trace"]
+        ]
+        return runtime

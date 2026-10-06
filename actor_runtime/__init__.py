@@ -6,6 +6,7 @@ from .runtime import (
     ActorRuntime,
     AdvanceResult,
     DedupResult,
+    SnapshotError,
     TraceEntry,
 )
 
@@ -18,6 +19,7 @@ __all__ = [
     "ActorRuntime",
     "AdvanceResult",
     "DedupResult",
+    "SnapshotError",
     "TraceEntry",
     "__version__",
 ]
