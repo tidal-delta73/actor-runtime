@@ -36,7 +36,9 @@ __all__ = [
     "ActorRuntime",
     "AdvanceResult",
     "DedupResult",
+    "FailureRecord",
     "SnapshotError",
+    "SupervisionError",
     "TraceEntry",
 ]
 
@@ -82,15 +84,51 @@ class DedupResult(NamedTuple):
     accepted: bool
 
 
+class FailureRecord(NamedTuple):
+    """A supervised actor failure awaiting a supervision decision.
+
+    Produced when a supervised actor's handler raises an :class:`Exception`
+    or an :class:`ActorDataCopyError` while processing ``message_id``. The
+    actor is paused and the failing message stays in its mailbox with its
+    original id and priority until the caller resolves the record as the
+    actor's current ``supervisor`` via :meth:`ActorRuntime.resolve_failure`.
+
+    ``supervision_path`` is the chain from the failed actor to the tree
+    root, including both ends; it is captured once and never shortened, so
+    an escalated record keeps showing where the failure happened. Records
+    are immutable, and the lists returned by :meth:`ActorRuntime.failures`
+    are independent copies.
+    """
+
+    actor_name: str
+    message_id: int
+    supervisor: str | None
+    error_type: str
+    error_text: str
+    supervision_path: tuple[str, ...]
+
+
+class SupervisionError(Exception):
+    """Raised when a supervision decision cannot be honoured.
+
+    A root actor -- one registered without a supervisor -- cannot escalate,
+    since there is no parent above it: :meth:`ActorRuntime.resolve_failure`
+    raises this error for ``"escalate"`` on such a record while leaving the
+    record, the pause and every mailbox exactly as they were.
+    """
+
+
 class ActorDataCopyError(Exception):
     """Raised when a message or state cannot be deep-copied.
 
     :meth:`ActorRuntime.send` raises it directly when the message cannot be
-    copied; :meth:`ActorRuntime.run` reports a copy failure during processing
-    as an :class:`ActorExecutionError` whose ``original`` is an
-    ``ActorDataCopyError``. Either way nothing is committed: no mailbox
-    change, no state change, no derived delivery, no trace entry and no
-    consumed message id. ``what`` names the data being copied and
+    copied. During :meth:`ActorRuntime.run`, an unsupervised actor's copy
+    failure is reported as an :class:`ActorExecutionError` whose
+    ``original`` is an ``ActorDataCopyError``; a supervised actor is paused
+    with a :class:`FailureRecord` whose ``error_type`` is
+    ``"ActorDataCopyError"`` instead. Either way nothing is committed: no
+    mailbox change, no state change, no derived delivery, no trace entry and
+    no consumed message id. ``what`` names the data being copied and
     ``original`` is the exception the copy raised.
     """
 
@@ -104,11 +142,16 @@ class ActorDataCopyError(Exception):
 
 
 class ActorExecutionError(Exception):
-    """Raised by :meth:`ActorRuntime.run` when a message handler fails.
+    """Raised by :meth:`ActorRuntime.run` when an unsupervised actor fails.
 
     The failing message stays unacknowledged in its actor's mailbox and no
     state or derived delivery is committed for it. Messages completed earlier
     in the same :meth:`~ActorRuntime.run` call remain committed.
+
+    An actor registered with a supervisor is handled differently: raises
+    from its handler never escape :meth:`~ActorRuntime.run` -- the actor is
+    paused, a :class:`FailureRecord` is produced and the run ends normally
+    returning the number of earlier completions.
     """
 
     def __init__(self, actor_name: str, message_id: int, original: BaseException):
@@ -207,9 +250,13 @@ def _validate_delivery_key(delivery_key: Any) -> None:
 
 
 class _Actor:
-    __slots__ = ("name", "state", "handler", "mailbox", "order", "dedup_keys")
+    __slots__ = (
+        "name", "state", "handler", "mailbox", "order", "dedup_keys",
+        "supervisor_name", "paused",
+    )
 
-    def __init__(self, name: str, state: Any, handler: Handler, order: int):
+    def __init__(self, name: str, state: Any, handler: Handler, order: int,
+                 supervisor_name: str | None = None):
         self.name = name
         self.state = state
         self.handler = handler
@@ -222,6 +269,12 @@ class _Actor:
         # stays deduplicated while its message is pending, completed or
         # waiting in the mailbox after a handler failure.
         self.dedup_keys: dict[str, int] = {}
+        # Name of the direct supervisor, or None for a tree root. The
+        # supervision tree never participates in scheduling.
+        self.supervisor_name = supervisor_name
+        # A supervised actor is paused while a FailureRecord for it is
+        # pending: new mail still arrives, but run skips the actor.
+        self.paused = False
 
 
 class _ScheduledDelivery:
@@ -265,6 +318,10 @@ class ActorRuntime:
         # Pending timed deliveries, kept in scheduling (message-id) order;
         # _release_due scans and rebuilds it.
         self._scheduled: list[_ScheduledDelivery] = []
+        # Unresolved supervised failures in production order. Each paused
+        # actor has exactly one record here; retry/drop remove it, escalate
+        # may move it to the actor's parent.
+        self._failures: list[FailureRecord] = []
 
     # -- shared delivery boundary -----------------------------------------
 
@@ -307,19 +364,60 @@ class ActorRuntime:
 
     # -- registration -----------------------------------------------------
 
-    def register(self, name: str, initial_state: Any, handler: Handler) -> None:
-        """Register a named actor.
+    def register(self, name: str, initial_state: Any, handler: Handler,
+                 supervisor: str | None = None) -> None:
+        """Register a named actor, optionally under a direct ``supervisor``.
+
+        With ``supervisor=None`` (the default) the actor is a supervision
+        tree root and keeps the baseline failure behaviour: a handler failure
+        aborts :meth:`run` with :class:`ActorExecutionError`. With a
+        supervisor name the actor is supervised: a handler failure pauses it
+        and produces a :class:`FailureRecord` instead of raising.
 
         Raises :class:`ValueError` when ``name`` is empty or already
-        registered; a failed registration changes nothing.
+        registered, when ``supervisor`` is empty or names the actor itself
+        (self-supervision); :class:`TypeError` when ``supervisor`` is neither
+        a string nor ``None``; :class:`LookupError` when ``supervisor`` names
+        an unregistered actor. A failed registration changes nothing: no
+        state is stored and registration order is unaffected.
         """
         if not isinstance(name, str) or name == "":
             raise ValueError("actor name must be a non-empty string")
+        supervisor_name = self._validate_supervisor_ref(name, supervisor)
         if name in self._actors:
             raise ValueError(f"actor already registered: {name!r}")
         self._actors[name] = _Actor(
-            name, copy.deepcopy(initial_state), handler, len(self._actors)
+            name, copy.deepcopy(initial_state), handler,
+            len(self._actors), supervisor_name,
         )
+
+    def _validate_supervisor_ref(self, name: str,
+                                 supervisor: Any) -> str | None:
+        """Check the optional supervisor argument of :meth:`register`."""
+        if supervisor is None:
+            return None
+        if not isinstance(supervisor, str):
+            raise TypeError("supervisor must be a string or None")
+        if supervisor == "":
+            raise ValueError("supervisor must be a non-empty string")
+        if supervisor == name:
+            raise ValueError(f"actor cannot supervise itself: {name!r}")
+        if supervisor not in self._actors:
+            raise LookupError(f"unknown supervisor: {supervisor!r}")
+        return supervisor
+
+    def _supervision_path(self, actor: _Actor) -> tuple[str, ...]:
+        """Walk the direct-supervisor links from ``actor`` to its root.
+
+        Registrations never disappear, so every link resolves. The tuple
+        starts with the failed actor and ends with the tree root.
+        """
+        path = [actor.name]
+        current = actor
+        while current.supervisor_name is not None:
+            current = self._actors[current.supervisor_name]
+            path.append(current.name)
+        return tuple(path)
 
     # -- delivery ---------------------------------------------------------
 
@@ -504,15 +602,26 @@ class ActorRuntime:
         """Process pending messages until mailboxes empty or ``limit`` hit.
 
         Derived messages become eligible only after the handling message
-        completes. The first handler failure aborts the run: an ordinary
-        exception is raised as :class:`ActorExecutionError`, while a
-        :class:`BaseException` that is not an :class:`Exception` (such as
-        :class:`KeyboardInterrupt`) propagates unchanged. A failure to
-        deep-copy the state, the message, the handler result or a buffered
-        derived message is raised as :class:`ActorExecutionError` whose
-        ``original`` is an :class:`ActorDataCopyError`. Either way the
-        failing message stays pending and nothing is committed for it.
-        Returns the number of messages completed by this call.
+        completes. Actors paused by a supervised failure are skipped while
+        the other actors keep draining; their new and due mail still enters
+        their mailboxes.
+
+        For an unsupervised actor (a tree root) the first handler failure
+        aborts the run: an ordinary exception is raised as
+        :class:`ActorExecutionError`, while a :class:`BaseException` that is
+        not an :class:`Exception` (such as :class:`KeyboardInterrupt`)
+        propagates unchanged, and a deep-copy failure of the state, message,
+        handler result or buffered derived message arrives as an
+        :class:`ActorExecutionError` whose ``original`` is an
+        :class:`ActorDataCopyError`.
+
+        For a supervised actor the same rollback happens -- the failing
+        message keeps its id and priority in the mailbox and no state,
+        derived delivery, id or trace entry is committed -- but instead of
+        raising, the actor is paused, a :class:`FailureRecord` is produced
+        and the run ends normally, returning the number of messages already
+        completed by this call. Non-:class:`Exception` ``BaseException``
+        subclasses still propagate unchanged regardless of supervision.
         """
         if limit is not None and (
             not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
@@ -523,7 +632,9 @@ class ActorRuntime:
         while limit is None or processed < limit:
             actor = None
             for candidate in self._actors.values():  # registration order
-                if candidate.mailbox:
+                # A paused actor waits for a supervision decision; its mail
+                # stays queued and run moves on to the other actors.
+                if candidate.mailbox and not candidate.paused:
                     actor = candidate
                     break
             if actor is None:
@@ -552,10 +663,14 @@ class ActorRuntime:
                         context,
                     )
                 except BaseException as exc:
-                    # Ordinary exceptions are wrapped; BaseException
-                    # subclasses that are not Exception (KeyboardInterrupt,
-                    # SystemExit, ...) propagate unchanged.
-                    if isinstance(exc, Exception):
+                    # Ordinary exceptions of an unsupervised actor are
+                    # wrapped; supervised actors carry the raw exception to
+                    # the shared rollback boundary below, which records it.
+                    # BaseException subclasses that are not Exception
+                    # (KeyboardInterrupt, SystemExit, ...) propagate
+                    # unchanged either way.
+                    if isinstance(exc, Exception) \
+                            and actor.supervisor_name is None:
                         raise ActorExecutionError(
                             actor.name, message_id, exc
                         ) from exc
@@ -576,10 +691,17 @@ class ActorRuntime:
                 # popped mail goes back through the same submission path
                 # with its original id and priority, and nothing is
                 # committed -- no state, derived delivery, consumed id or
-                # trace entry. A failed copy at the boundary is reported as
-                # an execution error; ActorExecutionError from the wrapper
-                # above and non-Exception BaseExceptions propagate as-is.
+                # trace entry.
                 self._push_mail(actor, priority, message_id, message)
+                if actor.supervisor_name is not None \
+                        and isinstance(exc, Exception):
+                    # Supervised failure: pause the actor, keep the message
+                    # for a later retry/drop decision and end this run
+                    # normally with the count so far. ActorDataCopyError at
+                    # the staging boundary is recorded as-is, mirroring the
+                    # unsupervised ActorExecutionError.original contract.
+                    self._record_failure(actor, message_id, exc)
+                    break
                 if isinstance(exc, ActorDataCopyError):
                     raise ActorExecutionError(
                         actor.name, message_id, exc
@@ -608,6 +730,131 @@ class ActorRuntime:
             processed += 1
 
         return processed
+
+    # -- supervision ------------------------------------------------------
+
+    def _record_failure(self, actor: _Actor, message_id: int,
+                        exc: BaseException) -> FailureRecord:
+        """Pause a supervised actor and append its immutable failure record.
+
+        Called only from the rollback boundary of :meth:`run`, after the
+        failing message was put back in the mailbox. Producing the record
+        consumes no message id and writes no trace entry: supervision is
+        not scheduling.
+        """
+        actor.paused = True
+        record = FailureRecord(
+            actor_name=actor.name,
+            message_id=message_id,
+            supervisor=actor.supervisor_name,
+            error_type=type(exc).__name__,
+            error_text=str(exc),
+            supervision_path=self._supervision_path(actor),
+        )
+        self._failures.append(record)
+        return record
+
+    def failures(self) -> list[FailureRecord]:
+        """Return pending failure records in production order.
+
+        A fresh list of independent records is returned each time; the
+        tuples are immutable, so neither the list nor its entries can affect
+        runtime state.
+        """
+        return list(self._failures)
+
+    def resolve_failure(self, actor_name: str, supervisor: str,
+                        action: str) -> FailureRecord | None:
+        """Resolve the pending failure of ``actor_name`` as ``supervisor``.
+
+        ``action`` is one of:
+
+        ``"retry"``
+            Delete the failure record and resume the actor; the failing
+            message stays in the mailbox with its original id and priority
+            and is retried by the next :meth:`run`.
+        ``"drop"``
+            Delete the failing message from the mailbox, delete the record
+            and resume the actor. The ``send_once`` reservation for the
+            message is deliberately kept, so the same delivery key still
+            confirms the dropped id.
+        ``"escalate"``
+            Hand the record to the actor's parent supervisor without
+            copying the message or consuming a message id: the record keeps
+            its position in the failure order and gains the parent as its
+            current supervisor; the actor stays paused.
+
+        Returns the resulting record after the action -- the escalated
+        record (same identity fields and path, current supervisor moved up)
+        for ``"escalate"`` -- or ``None`` when the failure was resolved away
+        (``"retry"``/``"drop"``). Raises :class:`LookupError` when no
+        pending record exists for ``actor_name`` or ``supervisor`` is not
+        the record's current supervisor, :class:`ValueError` for an unknown
+        ``action`` and :class:`SupervisionError` when a tree-root record is
+        escalated. A failed call changes no state: records, pauses,
+        mailboxes, order and dedup keys are all untouched.
+        """
+        if action not in ("retry", "drop", "escalate"):
+            raise ValueError(
+                "action must be one of 'retry', 'drop', 'escalate'"
+            )
+        index = self._find_failure_index(actor_name)
+        if index is None:
+            raise LookupError(
+                f"no pending failure for actor: {actor_name!r}"
+            )
+        record = self._failures[index]
+        if record.supervisor != supervisor:
+            raise LookupError(
+                f"actor {actor_name!r} is not supervised by "
+                f"{supervisor!r} for this failure"
+            )
+        if action == "escalate":
+            # The next step up the captured path: the current supervisor is
+            # always on it, and a root record has no successor.
+            path = record.supervision_path
+            current_index = path.index(record.supervisor)
+            if current_index == len(path) - 1:
+                raise SupervisionError(
+                    f"cannot escalate failure of {actor_name!r} beyond root "
+                    f"supervisor {record.supervisor!r}"
+                )
+            parent_name = path[current_index + 1]
+            escalated = record._replace(supervisor=parent_name)
+            self._failures[index] = escalated
+            return escalated
+
+        actor = self._actors[actor_name]
+        if action == "drop":
+            self._remove_mailbox_message(actor, record.message_id)
+        # retry leaves the message for the next run; both actions delete the
+        # record and release the pause. The send_once reservation is kept in
+        # either case.
+        del self._failures[index]
+        actor.paused = False
+        return None
+
+    def _find_failure_index(self, actor_name: str) -> int | None:
+        """Index of the pending failure record for ``actor_name``, if any."""
+        for index, record in enumerate(self._failures):
+            if record.actor_name == actor_name:
+                return index
+        return None
+
+    def _remove_mailbox_message(self, actor: _Actor,
+                                message_id: int) -> None:
+        """Drop one message by id from an actor's paused mailbox.
+
+        The failed actor is paused, so its mailbox cannot change between
+        the failed run and the supervision decision; the id is guaranteed
+        to be present. The heap is rebuilt rather than surgically removed,
+        keeping the canonical (-priority, id) order.
+        """
+        remaining = [
+            entry for entry in actor.mailbox if entry[1] != message_id
+        ]
+        heapq.heapify(remaining)
+        actor.mailbox = remaining
 
     # -- read-only queries ------------------------------------------------
 
@@ -650,11 +897,13 @@ class ActorRuntime:
         """Export the complete runtime state as deterministic bytes.
 
         The snapshot covers everything needed to resume later: actor
-        registration order and current states, every unacknowledged mailbox
-        message with its priority and message id, the timed deliveries
-        neither released nor expired, the ``send_once`` dedup records, the
-        logical clock, the next message id and the completion trace.
-        Handlers are code and are never serialised.
+        registration order and current states, the supervision tree (each
+        actor's direct supervisor), paused actors, every unacknowledged
+        mailbox message with its priority and message id, the timed
+        deliveries neither released nor expired, the ``send_once`` dedup
+        records, the pending supervision failure records in their
+        production order, the logical clock, the next message id and the
+        completion trace. Handlers are code and are never serialised.
 
         Only snapshot-safe data is supported: ``None``, booleans, integers,
         finite floats, strings, bytes and lists, tuples and string-keyed
@@ -690,7 +939,11 @@ class ActorRuntime:
         :meth:`send_once`, new deliveries continue numbering from the saved
         next id, timed deliveries keep their original deadlines and
         :meth:`run` keeps its registration-order, priority, rollback and
-        derived-message commit rules.
+        derived-message commit rules. The supervision tree, paused actors
+        and pending failure records are restored exactly, so the same
+        supervision decisions and inputs afterwards reproduce the same
+        state, trace and numbering; a message removed by a supervision
+        ``drop`` stays gone while its ``send_once`` reservation survives.
         """
         return _decode_snapshot(cls, data, handlers)
 
@@ -803,12 +1056,20 @@ def _encode_snapshot(runtime: ActorRuntime) -> bytes:
             for neg_priority, message_id, message in sorted(actor.mailbox)
         ]
         dedup = [[key, actor.dedup_keys[key]] for key in sorted(actor.dedup_keys)]
-        actors.append({
+        actor_node = {
             "name": actor.name,
             "state": _encode_value(actor.state, active),
             "mailbox": mailbox,
             "dedup": dedup,
-        })
+        }
+        # Supervision fields are only emitted when they carry non-default
+        # data, so a runtime without supervised actors exports exactly the
+        # bytes the baseline format did; restore treats them as optional.
+        if actor.supervisor_name is not None:
+            actor_node["supervisor"] = actor.supervisor_name
+        if actor.paused:
+            actor_node["paused"] = True
+        actors.append(actor_node)
     scheduled = [
         {
             "id": delivery.message_id,
@@ -840,6 +1101,21 @@ def _encode_snapshot(runtime: ActorRuntime) -> bytes:
         "scheduled": scheduled,
         "trace": trace,
     }
+    # Pending failures are only emitted when supervision is actually in use,
+    # keeping the bytes of an unsupervised runtime baseline-identical. The
+    # list order is the production order resolve_failure preserves.
+    if runtime._failures:
+        payload["failures"] = [
+            {
+                "actor": record.actor_name,
+                "message_id": record.message_id,
+                "supervisor": record.supervisor,
+                "error_type": record.error_type,
+                "error_text": record.error_text,
+                "path": list(record.supervision_path),
+            }
+            for record in runtime._failures
+        ]
     # The digest covers the canonical payload bytes, so a restore can
     # recompute it over the re-serialised parsed payload: the canonical
     # form is a fixed point of parse/serialise.
@@ -1013,7 +1289,49 @@ def _decode_snapshot(
                      "dedup message id shared by two keys")
             dedup_first_ids.add(first_id)
             dedup[key] = first_id
-        decoded_actors.append((name, state, mailbox, dedup))
+        # Optional supervision fields: absent means a baseline root actor,
+        # never paused.
+        supervisor_name = actor_node.get("supervisor")
+        _require(
+            supervisor_name is None or type(supervisor_name) is str,
+            "supervisor must be a string",
+        )
+        paused_flag = actor_node.get("paused", False)
+        _require(type(paused_flag) is bool, "paused must be a boolean")
+        decoded_actors.append(
+            (name, state, mailbox, dedup, supervisor_name, paused_flag)
+        )
+
+    # The supervision graph only makes sense once every name is known.
+    supervisor_by_name = {
+        name: supervisor_name
+        for name, _state, _mailbox, _dedup, supervisor_name, _paused
+        in decoded_actors
+    }
+    actual_paths: dict[str, tuple[str, ...]] = {}
+    for name, _state, _mailbox, _dedup, supervisor_name, _paused \
+            in decoded_actors:
+        if supervisor_name is not None:
+            _require(
+                supervisor_name != name and supervisor_name in names,
+                f"actor {name!r} references unknown supervisor "
+                f"{supervisor_name!r}",
+            )
+            # Re-walk the links with a visited set so a tampered cycle can
+            # never loop forever; every chain must end at a root.
+            path = [name]
+            current = supervisor_name
+            seen = {name}
+            while True:
+                _require(current not in seen,
+                         f"supervision cycle at {current!r}")
+                seen.add(current)
+                path.append(current)
+                current_sup = supervisor_by_name[current]
+                if current_sup is None:
+                    break
+                current = current_sup
+            actual_paths[name] = tuple(path)
 
     decoded_scheduled = []
     for node in scheduled_node:
@@ -1078,29 +1396,102 @@ def _decode_snapshot(
         ))
 
     # Cross-structure relation: a dedup record always points at the first
-    # delivery accepted for its key, which is either still waiting in a
-    # mailbox or already completed and present in the trace.
-    for name, _state, _mailbox, dedup in decoded_actors:
+    # delivery accepted for its key. That id is still waiting in a mailbox,
+    # already completed and present in the trace, or was removed by a
+    # supervision ``drop`` while the key stayed reserved -- in which case it
+    # is simply an issued id (below next_message_id) absent from every live
+    # structure. The only rejected case is an id that lives solely in the
+    # scheduled set, which can never have been accepted into a mailbox.
+    scheduled_only_ids = set(live_ids) - reachable_ids
+    for name, _state, _mailbox, dedup, _sup, _paused in decoded_actors:
         for key, first_id in dedup.items():
-            _require(first_id in reachable_ids,
+            _require(first_id not in scheduled_only_ids,
                      f"dedup key {key!r} of actor {name!r} references an "
                      "unknown message")
+
+    # Pending supervised failures. Absent on baseline snapshots; when
+    # present, every record must describe a supervised, paused actor whose
+    # failing message is still waiting in that actor's mailbox.
+    failures_node = payload.get("failures", [])
+    _require(isinstance(failures_node, list), "failures must be a list")
+    mailbox_ids = {
+        name: {message_id for message_id, _priority, _message in mailbox}
+        for name, _state, mailbox, _dedup, _sup, _paused in decoded_actors
+    }
+    paused_names: set[str] = set()
+    decoded_failures: list[FailureRecord] = []
+    for node in failures_node:
+        _require(isinstance(node, dict), "failure entry must be an object")
+        try:
+            actor_name = node["actor"]
+            message_id = node["message_id"]
+            supervisor_name = node["supervisor"]
+            error_type = node["error_type"]
+            error_text = node["error_text"]
+            path_node = node["path"]
+        except KeyError as exc:
+            raise SnapshotError(
+                f"missing failure field: {exc.args[0]!r}"
+            ) from exc
+        _require(type(actor_name) is str and actor_name in names,
+                 "failure names an unknown actor")
+        _require(actor_name not in paused_names,
+                 f"multiple pending failures for actor: {actor_name!r}")
+        paused_names.add(actor_name)
+        actor_tuple = next(
+            a for a in decoded_actors if a[0] == actor_name
+        )
+        _require(actor_tuple[4] is not None,
+                 f"failure for unsupervised actor: {actor_name!r}")
+        _require(type(message_id) is int
+                 and message_id in mailbox_ids[actor_name],
+                 "failure message must still be in the actor's mailbox")
+        path = actual_paths[actor_name]
+        _require(
+            type(supervisor_name) is str and supervisor_name in path[1:],
+            "failure supervisor must be an ancestor on the supervision path",
+        )
+        _require(type(error_type) is str and error_type != "",
+                 "failure error_type must be a non-empty string")
+        _require(type(error_text) is str,
+                 "failure error_text must be a string")
+        _require(isinstance(path_node, list)
+                 and all(type(part) is str and part != ""
+                         for part in path_node),
+                 "failure path must be a list of non-empty strings")
+        _require(tuple(path_node) == path,
+                 "failure path does not match the supervision tree")
+        decoded_failures.append(FailureRecord(
+            actor_name=actor_name,
+            message_id=message_id,
+            supervisor=supervisor_name,
+            error_type=error_type,
+            error_text=error_text,
+            supervision_path=path,
+        ))
+
+    # Pause markers and pending records must agree in both directions.
+    for name, _state, _mailbox, _dedup, _sup, paused_flag in decoded_actors:
+        _require(paused_flag == (name in paused_names),
+                 f"paused flag and failure records disagree for {name!r}")
 
     # Handler boundary: every snapshotted actor needs a handler; extra
     # mappings are ignored. Checked before assembly so a failure produces
     # no runtime at all.
-    for name, _state, _mailbox, _dedup in decoded_actors:
+    for name, _state, _mailbox, _dedup, _sup, _paused in decoded_actors:
         if name not in handlers:
             raise LookupError(f"no handler provided for actor: {name!r}")
 
     runtime = cls()
     runtime._clock = clock
     runtime._next_message_id = next_message_id
-    for order, (name, state, mailbox, dedup) in enumerate(decoded_actors):
-        actor = _Actor(name, state, handlers[name], order)
+    for order, (name, state, mailbox, dedup,
+                supervisor_name, paused_flag) in enumerate(decoded_actors):
+        actor = _Actor(name, state, handlers[name], order, supervisor_name)
         for message_id, priority, message in mailbox:
             heapq.heappush(actor.mailbox, (-priority, message_id, message))
         actor.dedup_keys = dict(dedup)
+        actor.paused = paused_flag
         runtime._actors[name] = actor
     runtime._scheduled = [
         _ScheduledDelivery(
@@ -1111,4 +1502,5 @@ def _decode_snapshot(
              scheduled_at, release_at, expire_at) in decoded_scheduled
     ]
     runtime._trace = list(decoded_trace)
+    runtime._failures = list(decoded_failures)
     return runtime
