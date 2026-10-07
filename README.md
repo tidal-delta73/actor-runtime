@@ -125,6 +125,58 @@ rt.send_once("other", "order-42", {"n": 1})  # accepted: other actor, same key
   independent runtimes produce identical `DedupResult` sequences, final
   states and completion traces.
 
+### Supervision trees
+
+Actors registered without a `supervisor` argument are roots and keep the
+unsupervised failure contract unchanged: a handler failure aborts `run`
+with `ActorExecutionError`. Passing an already registered actor's name as
+`register(name, state, handler, supervisor=...)` makes it the new actor's
+**direct supervisor**; supervision edges form a forest and never
+participate in scheduling.
+
+```python
+rt.register("root", [], handler)
+rt.register("worker-a", [], handler, supervisor="root")
+rt.register("worker-b", [], handler, supervisor="root")
+```
+
+- Validation: a non-string `supervisor` raises `TypeError`; `""` or
+  self-supervision raises `ValueError`; an unknown supervisor raises
+  `LookupError`; name checks stay as before. A failed registration changes
+  nothing — no state, no order slot, no supervision edge.
+- When a **supervised** actor's handler raises an `Exception` (including an
+  `ActorDataCopyError` at the copy boundary), the existing rollback
+  semantics apply exactly as for roots: the failing message keeps its
+  original id and priority in the mailbox and no state, derived delivery,
+  consumed id or trace entry is committed. Instead of raising, the actor is
+  **paused**, `run` ends and returns the number of messages already
+  completed, and an immutable `FailureRecord(actor, message_id,
+  supervisor, error_type, error_text, supervision_path)` is produced.
+  `BaseException` subclasses (e.g. `KeyboardInterrupt`) still propagate
+  unwrapped, for every actor.
+- While paused, new deliveries and released timed messages still enter the
+  actor's mailbox (counted by `pending_count`); `run` skips the paused
+  actor and keeps processing the others.
+- Pending records are queried in production order with `rt.failures()`
+  (independent copies). The current supervisor resolves one with
+  `resolve_failure(supervisor, actor, message_id, action)`:
+  - `"retry"` — delete the record and resume; the original message is
+    retried by the next `run` with its id and priority intact;
+  - `"drop"` — delete the failing message and resume, with no trace entry
+    and no consumed id; `send_once` keys pointing at it are retained;
+  - `"escalate"` — hand the record to the supervisor's own supervisor;
+    the record is rewritten in place (same production-order slot, same
+    failure message — nothing is copied or renumbered) and the failed
+    actor stays paused. Escalating a root's failure raises
+    `SupervisionError` and keeps the record and pause.
+- An unknown record, or a caller that is not the record's current
+  supervisor, raises `LookupError`; an unknown action raises
+  `ValueError`. A failed resolution changes nothing.
+- Supervision edges, pause marks, pending records and their order, and the
+  ids removed by `drop` are all part of snapshots: after
+  `restore_snapshot` the same actions and input sequence reproduce the
+  same states, traces and message numbering.
+
 ### Deterministic snapshots
 
 `rt.export_snapshot()` returns the complete runtime state as persistable
@@ -141,8 +193,11 @@ restored.send_once("counter", "order-42", {"n": 1})
 # DedupResult(message_id=1, accepted=False) — dedup records survive
 ```
 
-- The snapshot covers actor registration order and current states, every
-  unacknowledged mailbox message with its priority and id, the timed
+- The snapshot covers actor registration order and current states, the
+  supervision tree (each actor's direct supervisor) and pause marks, every
+  unacknowledged mailbox message with its priority and id, the pending
+  supervision failures in production order with their current supervisor
+  and supervision path, the ids removed by a supervision `drop`, the timed
   deliveries neither released nor expired, the dedup records, the logical
   clock, the next message id and the completion trace.
 - Snapshot-safe data: `None`, booleans, integers, finite floats, strings,
@@ -170,7 +225,11 @@ restored.send_once("counter", "order-42", {"n": 1})
 
 - An actor is a unique non-empty string name, an initial state and a handler
   `handler(state, message, ctx) -> new_state`. Registering an empty or
-  duplicate name raises `ValueError`.
+  duplicate name raises `ValueError`. An optional fourth argument names an
+  already registered direct supervisor; a non-string value raises
+  `TypeError`, an empty name or self-supervision raises `ValueError` and an
+  unknown name raises `LookupError`, with no state added on failure.
+  Actors without a supervisor are roots.
 - `send(target, message, priority=0)` returns a runtime-wide monotonic
   message id and enqueues a private copy in the actor's mailbox. Unknown
   targets raise `LookupError`; non-integer priority raises `TypeError`; a
@@ -193,9 +252,12 @@ restored.send_once("counter", "order-42", {"n": 1})
   the handler raises, or copying the state, the message, the handler result
   or a buffered derived message fails, the message stays unacknowledged,
   nothing is committed (no state, no derived delivery, no id, no trace
-  entry) and `run` raises `ActorExecutionError` (exposing `actor_name`,
-  `message_id` and `original` — an `ActorDataCopyError` for copy
-  failures); earlier completed messages remain committed.
+  entry); earlier completed messages remain committed. For an actor
+  without a supervisor `run` then raises `ActorExecutionError` (exposing
+  `actor_name`, `message_id` and `original` — an `ActorDataCopyError` for
+  copy failures). For a supervised actor the same rollback happens but the
+  actor pauses and `run` returns the count completed so far, leaving a
+  `FailureRecord` for `resolve_failure` instead of raising.
 - `run(limit=None)` processes until idle; a non-positive or non-integer
   `limit` raises `ValueError` without consuming any message. `BaseException`
   subclasses (e.g. `KeyboardInterrupt`) propagate unwrapped.
@@ -204,9 +266,11 @@ restored.send_once("counter", "order-42", {"n": 1})
   `TraceEntry` has `message_id`, `actor_name`, `priority`, `state_before`
   and `state_after`.
 
-Only single-process semantics are provided: no supervision, parallel
-scheduling or implicit persistence — snapshots are exported and restored
-only through the explicit `export_snapshot` / `restore_snapshot` entries.
+Only single-process semantics are provided: the supervision tree is
+synchronous and explicit — failures pause one actor and wait for a
+`resolve_failure` decision, there is no parallel scheduling, automatic
+restart or implicit persistence — snapshots are exported and restored only
+through the explicit `export_snapshot` / `restore_snapshot` entries.
 Time is logical and only advances via explicit `advance` calls — there is
 no wall-clock access and no threads.
 
